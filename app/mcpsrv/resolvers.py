@@ -50,6 +50,60 @@ _QN_PREFIX_CYPHER = "\nUNION\n".join(
     for label in _QN_LABELS
 )
 
+# Все метки с qualified_name одним label-выражением. `MATCH (n:A|B|… {qualified_name: $x})`
+# Neo4j планирует как Union уникальных index seek по меткам, а тот же MATCH без метки —
+# как AllNodesScan всего графа.
+QN_LABEL_EXPR = "|".join(_QN_LABELS)
+
+# Регистронезависимый поиск внутри одной конфигурации — prefix seek по индексам
+# qualified_name вместо скана всех узлов графа.
+_CI_QN_UNDER_ROOT_CYPHER = (
+    f"MATCH (n:{QN_LABEL_EXPR}) WHERE n.qualified_name STARTS WITH $root_prefix "
+    "AND toLower(n.qualified_name) = toLower($ref) RETURN DISTINCT n.qualified_name AS qn"
+)
+_CI_QN_SUBTREE_UNDER_ROOT_CYPHER = (
+    f"MATCH (n:{QN_LABEL_EXPR}) WHERE n.qualified_name STARTS WITH $root_prefix "
+    "AND (toLower(n.qualified_name) = toLower($ref) "
+    "OR toLower(n.qualified_name) STARTS WITH toLower($ref) + '/') "
+    "RETURN left(n.qualified_name, size($ref)) AS qn LIMIT 1"
+)
+
+
+def _config_roots(loader: "GraphDatabaseLoader") -> List[str]:
+    """qualified_name всех Configuration графа: каждый узел с qualified_name — это сама
+    конфигурация или лежит под `<её qualified_name>/`."""
+    rows = loader.execute_query_readonly(
+        "MATCH (c:Configuration) WHERE c.qualified_name IS NOT NULL RETURN c.qualified_name AS qn"
+    ) or []
+    return [r["qn"] for r in rows if r.get("qn")]
+
+
+def qn_case_variants(loader: "GraphDatabaseLoader", ref: str) -> List[str]:
+    """qualified_name узлов графа, равные `ref` без учёта регистра, — замена
+    `toLower(n.qualified_name) = toLower($ref)` по label-free `MATCH (n)`.
+
+    Сначала точный index seek: имена 1С уникальны без учёта регистра, так что при точном
+    совпадении других вариантов нет. Иначе — регистронезависимый поиск только внутри
+    конфигураций, чей qualified_name (без учёта регистра) — префикс ref: вне их совпадений
+    быть не может. Для обычных ссылок вида `Справочник.Контрагенты` ни одна конфигурация
+    не подходит, и в Neo4j уходят только два дешёвых запроса.
+    """
+    rows = loader.execute_query_readonly(_QN_EXACT_CYPHER, {"ref": ref}) or []
+    if rows and rows[0].get("qn"):
+        return [rows[0]["qn"]]
+    ref_low = ref.lower()
+    found = set()
+    for root in _config_roots(loader):
+        root_low = root.lower()
+        if ref_low == root_low:
+            found.add(root)
+        elif ref_low.startswith(root_low + "/"):
+            rows = loader.execute_query_readonly(
+                _CI_QN_UNDER_ROOT_CYPHER, {"root_prefix": root + "/", "ref": ref}
+            ) or []
+            found.update(r["qn"] for r in rows if r.get("qn"))
+    return sorted(found)
+
 
 def _canon_category_or_raw(raw: str) -> str:
     """Canonicalize a category segment (Справочник -> Справочники) via the shared
@@ -278,15 +332,19 @@ def normalize_qn_ref(
         if rows and rows[0].get("qn"):
             return rows[0]["qn"]
 
-        fallback_cypher = """
-MATCH (n)
-WHERE toLower(n.qualified_name) = toLower($ref)
-   OR toLower(n.qualified_name) STARTS WITH toLower($ref) + '/'
-RETURN left(n.qualified_name, size($ref)) AS qn LIMIT 1
-""".strip()
-        rows = loader.execute_query_readonly(fallback_cypher, {"ref": ref}) or []
-        if rows and rows[0].get("qn"):
-            return rows[0]["qn"]
+        # Регистронезависимый fallback только внутри конфигураций, под которыми ref
+        # может лежать, — вместо label-free скана всего графа на каждую неизвестную ссылку.
+        ref_low = ref.lower()
+        for root in _config_roots(loader):
+            root_low = root.lower()
+            if ref_low == root_low:
+                return root
+            if ref_low.startswith(root_low + "/"):
+                rows = loader.execute_query_readonly(
+                    _CI_QN_SUBTREE_UNDER_ROOT_CYPHER, {"root_prefix": root + "/", "ref": ref}
+                ) or []
+                if rows and rows[0].get("qn"):
+                    return rows[0]["qn"]
         raise ValueError(f"Unknown owner_ref: {ref!r} not found in graph")
 
     # Canonicalize a leading category segment (Справочник.X -> Справочники.X) so refs with
@@ -303,17 +361,18 @@ RETURN left(n.qualified_name, size($ref)) AS qn LIMIT 1
                 ref = project_prefix + config_name + "/" + ref[len(pfx):]
                 break
 
+        # Первые две ветки исходного UNION (toLower(qualified_name) по label-free
+        # MATCH (n), то есть два скана всего графа на каждый вызов) считаются через
+        # qn_case_variants. Узел из них начинается с config_prefix, значит и сам кандидат
+        # (без учёта регистра) — иначе ветка заведомо пуста и в Neo4j не ходим.
+        ci_qns = set()
+        for candidate in (ref, (project_name or "") + "/" + ref):
+            if candidate.lower().startswith(config_prefix.lower()):
+                ci_qns.update(
+                    qn for qn in qn_case_variants(loader, candidate)
+                    if qn.startswith(config_prefix)
+                )
         cypher = """
-MATCH (n)
-WHERE toLower(n.qualified_name) = toLower($ref)
-  AND n.qualified_name STARTS WITH $config_prefix
-RETURN n.qualified_name AS qn
-UNION
-MATCH (n)
-WHERE toLower(n.qualified_name) = toLower($project_name + '/' + $ref)
-  AND n.qualified_name STARTS WITH $config_prefix
-RETURN n.qualified_name AS qn
-UNION
 MATCH (m:MetadataObject)
 WHERE (toLower(m.category_name) + '.' + toLower(m.name) = toLower($ref)
    OR toLower(m.category_name) + '/' + toLower(m.name) = toLower($ref))
@@ -333,13 +392,13 @@ ORDER BY qn LIMIT 5
 """.strip().replace("__FORM_OR__", _form_ref_or_conditions("ref"))
         params = {"ref": ref, "project_name": project_name, "config_prefix": config_prefix}
         rows = loader.execute_query_readonly(cypher, params) or []
-        qns = sorted({r.get("qn") for r in rows if isinstance(r, dict) and r.get("qn")})
+        qns = sorted(ci_qns | {r.get("qn") for r in rows if isinstance(r, dict) and r.get("qn")})
 
         if len(qns) == 1:
             return qns[0]
         if len(qns) == 0:
-            sfx_cypher = """
-MATCH (n)
+            sfx_cypher = f"""
+MATCH (n:{QN_LABEL_EXPR})
 WHERE n.qualified_name ENDS WITH $ref
   AND n.qualified_name STARTS WITH $config_prefix
 RETURN n.qualified_name AS qn ORDER BY qn LIMIT 5
@@ -358,15 +417,11 @@ RETURN n.qualified_name AS qn ORDER BY qn LIMIT 5
         )
 
     # No config_name — project-wide lookup
+    # Первые две ветки исходного UNION — через qn_case_variants (см. ветку с config_name).
+    ci_qns = set(qn_case_variants(loader, ref)) | set(
+        qn_case_variants(loader, (project_name or "") + "/" + ref)
+    )
     cypher = """
-MATCH (n)
-WHERE toLower(n.qualified_name) = toLower($ref)
-RETURN n.qualified_name AS qn
-UNION
-MATCH (n)
-WHERE toLower(n.qualified_name) = toLower($project_name + '/' + $ref)
-RETURN n.qualified_name AS qn
-UNION
 MATCH (m:MetadataObject)
 WHERE toLower(m.category_name) + '.' + toLower(m.name) = toLower($ref)
    OR toLower(m.category_name) + '/' + toLower(m.name) = toLower($ref)
@@ -383,13 +438,14 @@ ORDER BY qn LIMIT 5
 """.strip().replace("__FORM_OR__", _form_ref_or_conditions("ref"))
     params = {"ref": ref, "project_name": project_name}
     rows = loader.execute_query_readonly(cypher, params) or []
-    qns = sorted({r.get("qn") for r in rows if isinstance(r, dict) and r.get("qn")})
+    qns = sorted(ci_qns | {r.get("qn") for r in rows if isinstance(r, dict) and r.get("qn")})
 
     if len(qns) == 1:
         return qns[0]
     if len(qns) == 0:
-        sfx_cypher = """
-MATCH (n)
+        # Суффикс индексом не ищется, но метки отсекают Routine/Module (большую часть узлов графа).
+        sfx_cypher = f"""
+MATCH (n:{QN_LABEL_EXPR})
 WHERE n.qualified_name ENDS WITH $ref
 RETURN n.qualified_name AS qn ORDER BY qn LIMIT 5
 """.strip()
@@ -666,7 +722,7 @@ def _md_node_labels(loader, qn: str, pn: str) -> List[str]:
     form-child nodes carry no project_name). [] if absent."""
     rows = _run_query(
         loader,
-        "MATCH (n) WHERE n.qualified_name = $qn RETURN labels(n) AS labels LIMIT 1",
+        f"MATCH (n:{QN_LABEL_EXPR}) WHERE n.qualified_name = $qn RETURN labels(n) AS labels LIMIT 1",
         {"qn": qn}, pn,
     )
     labels = rows[0].get("labels") if rows else None
@@ -826,8 +882,8 @@ def resolve_form_event_ref(loader, ref: str, project_name: str,
         # form-level event: <form path>.<Event>.<event>
         owner_qn = resolve_form_owner_ref(loader, ".".join(segs[:-2]), project_name, config_name=config_name)
     cypher = (
-        "MATCH (owner)-[:HAS_EVENT]->(fe:FormEvent)\n"
-        "WHERE owner.qualified_name = $owner_qn AND toLower(fe.name) = toLower($ev)\n"
+        f"MATCH (owner:{QN_LABEL_EXPR} {{qualified_name: $owner_qn}})-[:HAS_EVENT]->(fe:FormEvent)\n"
+        "WHERE toLower(fe.name) = toLower($ev)\n"
         "RETURN fe.qualified_name AS qn ORDER BY qn LIMIT 5"
     )
     params = {"owner_qn": owner_qn, "ev": event_name}
@@ -849,8 +905,9 @@ def resolve_control_ref(loader, owner_ref: str, control_name: str, project_name:
     ValueError on an unresolvable form owner or on duplicate control names (ambiguity)."""
     form_qn = resolve_form_owner_ref(loader, owner_ref, project_name, config_name=config_name)
     cypher = (
-        "MATCH (owner)-[:HAS_CONTROL]->(:FormControl)-[:HAS_CHILD*0..]->(fc:FormControl)\n"
-        "WHERE owner.qualified_name = $form_qn AND toLower(fc.name) = toLower($name)\n"
+        f"MATCH (owner:{QN_LABEL_EXPR} {{qualified_name: $form_qn}})"
+        "-[:HAS_CONTROL]->(:FormControl)-[:HAS_CHILD*0..]->(fc:FormControl)\n"
+        "WHERE toLower(fc.name) = toLower($name)\n"
         "RETURN fc.qualified_name AS qn ORDER BY qn LIMIT 5"
     )
     params = {"form_qn": form_qn, "name": (control_name or "").strip()}

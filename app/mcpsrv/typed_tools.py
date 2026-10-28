@@ -22,6 +22,8 @@ from .neo4j_init import initialize_neo4j, get_loader, get_search_ready_loader
 from .queries import _run_query, apply_match, apply_match_norm, clamp_limit, clamp_offset
 from .resolvers import (
     ConfigScope,
+    QN_LABEL_EXPR,
+    qn_case_variants,
     _canon_category_or_raw,
     _canon_leading_category,
     _resolve_config_name,
@@ -4531,22 +4533,27 @@ WITH {carry},
                         match_ref = normalize_qn_ref(loader, ref, pn, config_name=config_name)
                     except ValueError:
                         match_ref = ref
+                    # toLower(qualified_name) по label-free MATCH (n) — скан всего
+                    # графа; варианты написания считаются заранее, сам поиск идёт index seek.
                     cypher = f"""
-MATCH (n)
+MATCH (n:{QN_LABEL_EXPR})
 WHERE {_md_scope_where('n', config_name=config_name)}
-  AND toLower(n.qualified_name) = toLower($ref)
+  AND n.qualified_name IN $ci_qns
 RETURN head(labels(n)) AS kind, n.qualified_name AS qualified_name,
   coalesce(n.name, '') AS name, coalesce(n.config_name,'') AS config_name
 LIMIT 1
 """.strip()
-                    params: Dict[str, Any] = {"ref": match_ref, "project_prefix": project_prefix}
+                    params: Dict[str, Any] = {
+                        "ref": match_ref, "project_prefix": project_prefix,
+                        "ci_qns": qn_case_variants(loader, match_ref),
+                    }
                     if config_name:
                         params["config_name"] = config_name
                     res_lim, res_off = 1, 0
 
                 elif ref_type == "qualified_name_prefix":
                     cypher = f"""
-MATCH (n {{project_name:$project_name{scope.metadata_map}}})
+MATCH (n:{QN_LABEL_EXPR} {{project_name:$project_name{scope.metadata_map}}})
 WHERE n.qualified_name STARTS WITH $ref
 RETURN n.qualified_name AS qualified_name, head(labels(n)) AS kind,
   coalesce(n.name, '') AS name, coalesce(n.config_name,'') AS config_name
@@ -4722,8 +4729,11 @@ SKIP $offset LIMIT $limit
 
                 elif ref_type in ("qualified_name", "qualified_name_prefix"):
                     cfg_filter = "\n  AND n.config_name = $config_name" if config_name else ""
+                    # Оба фильтра требуют qualified_name, поэтому MATCH ниже идёт по меткам
+                    # с индексом qualified_name; регистронезависимое равенство — через IN по
+                    # заранее найденным вариантам написания (см. qn_case_variants).
                     if ref_type == "qualified_name":
-                        qn_filter = "AND toLower(n.qualified_name) = toLower($ref)"
+                        qn_filter = "AND n.qualified_name IN $ci_qns"
                     else:
                         qn_filter = "AND n.qualified_name STARTS WITH $ref"
                     if has_extensions:
@@ -4747,7 +4757,7 @@ WITH n,
                     else:
                         _adp_qn = ""
                     cypher = f"""
-MATCH (n)
+MATCH (n:{QN_LABEL_EXPR})
 WHERE (n.project_name = $project_name OR n.qualified_name STARTS WITH $project_prefix)
   {qn_filter}{cfg_filter}
 {_adp_qn}
@@ -4776,6 +4786,8 @@ SKIP $offset LIMIT $limit
                     }
                     if config_name:
                         p2["config_name"] = config_name
+                    if not _is_prefix:
+                        p2["ci_qns"] = qn_case_variants(loader, match_ref)
                     rows = _run_query(loader, cypher, p2, pn)
                     if has_extensions:
                         rows = _strip_null_adoption(rows)
@@ -6769,7 +6781,7 @@ Use routine_name/routine_name_match to filter routines.
                 owner_qn = normalize_qn_ref(loader, owner_ref.strip(), pn, config_name)
                 params["owner_qn"] = owner_qn
                 cypher = f"""
-MATCH (o {{qualified_name:$owner_qn}})-[:HAS_MODULE]->(m:Module)
+MATCH (o:{QN_LABEL_EXPR} {{qualified_name:$owner_qn}})-[:HAS_MODULE]->(m:Module)
 WHERE true{config_filter}
 RETURN coalesce(m.name,'') AS name, coalesce(m.module_type,'') AS module_type,
   coalesce(m.path,'') AS path, m.id AS id,
@@ -6873,7 +6885,7 @@ CALL {{
   WHERE true{rn_filter}{r_config_filter}
   RETURN r
   UNION
-  MATCH (o {{qualified_name:$owner_qn}})-[:HAS_MODULE]->(m:Module)-[:DECLARES]->(r:Routine)
+  MATCH (o:{QN_LABEL_EXPR} {{qualified_name:$owner_qn}})-[:HAS_MODULE]->(m:Module)-[:DECLARES]->(r:Routine)
   WHERE true{rn_filter}{r_config_filter}
   RETURN r
 }}
@@ -6886,8 +6898,8 @@ RETURN {routine_fields}{interception_col},
 ORDER BY name, id SKIP $offset LIMIT $limit
 """.strip()
                 routine_rows = _run_query(loader, cypher, params, pn)
-                owner_cypher = """
-MATCH (o {qualified_name:$owner_qn, project_name:$project_name})
+                owner_cypher = f"""
+MATCH (o:{QN_LABEL_EXPR} {{qualified_name:$owner_qn, project_name:$project_name}})
 RETURN coalesce(o.config_name, o.name) AS config_name,
   o.qualified_name AS owner_qn,
   coalesce(o.name,'') AS owner_name

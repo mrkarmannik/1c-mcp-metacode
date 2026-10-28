@@ -10,6 +10,7 @@ from typing import Any
 
 from config import settings
 from mcpsrv.neo4j_init import get_loader
+from mcpsrv.resolvers import QN_LABEL_EXPR
 
 
 DEFAULT_LIMIT = 100
@@ -1063,12 +1064,7 @@ def get_node(ref: str) -> dict[str, Any]:
     ref = _normalize_node_ref(ref)
     rows = _run(
         """
-        MATCH (n {qualified_name: $ref})
-        WHERE n:Configuration OR n:MetadataCategory OR n:MetadataObject OR n:Form
-           OR n:Command OR n:Module OR n:Routine OR n:Attribute OR n:TabularPart
-           OR n:Resource OR n:Dimension OR n:Layout OR n:EnumValue OR n:PredefinedItem
-           OR n:JournalGraph
-           OR n:FormControl OR n:FormAttribute
+        MATCH (n:Configuration|MetadataCategory|MetadataObject|Form|Command|Attribute|TabularPart|Resource|Dimension|Layout|EnumValue|PredefinedItem|JournalGraph|FormControl|FormAttribute {qualified_name: $ref})
         OPTIONAL MATCH (n)-[:ADOPTED_FROM]->(base_node)
         RETURN labels(n)[0] AS label,
                coalesce(n.name, n.`Имя`, '') AS name,
@@ -1119,8 +1115,7 @@ def get_node(ref: str) -> dict[str, Any]:
 def _node_events(ref: str) -> list[dict[str, Any]]:
     rows = _run(
         """
-        MATCH (n {qualified_name: $ref})
-        WHERE n:Form OR n:FormControl OR n:MetadataObject
+        MATCH (n:Form|FormControl|MetadataObject {qualified_name: $ref})
         MATCH (n)-[:HAS_EVENT]->(e:FormEvent)
         OPTIONAL MATCH (e)-[:HAS_EVENT_ACTION]->(a:FormEventAction)
         OPTIONAL MATCH (a)-[:HAS_HANDLER]->(r:Routine)
@@ -1385,7 +1380,7 @@ def get_module(
     elif owner_ref and module_type and module_type != "CommonModule":
         rows = _run(
             """
-            MATCH (owner {qualified_name: $owner_ref, project_name: $project_name})-[:HAS_MODULE]->(mod:Module)
+            MATCH (owner:""" + QN_LABEL_EXPR + """ {qualified_name: $owner_ref, project_name: $project_name})-[:HAS_MODULE]->(mod:Module)
             WHERE mod.module_type = $module_type
             OPTIONAL MATCH (mod)-[:DECLARES]->(r:Routine)
             WITH mod, owner, r

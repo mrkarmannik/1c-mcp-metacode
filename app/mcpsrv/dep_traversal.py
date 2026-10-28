@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from config import settings
 from .queries import _run_query
 from .resolvers import (
+    QN_LABEL_EXPR,
     resolve_object_ref,
     resolve_element_ref,
     resolve_form_owner_ref,
@@ -82,7 +83,7 @@ def _lookup_qn_start(
     not matter). Returns None when no node with this qualified_name exists. Raises on a
     config-scope violation or an existing node whose label is not a valid dependency start."""
     rows = loader.execute_query_readonly(
-        "MATCH (n {qualified_name: $qn}) RETURN labels(n) AS labels LIMIT 1", {"qn": ref}
+        f"MATCH (n:{QN_LABEL_EXPR} {{qualified_name: $qn}}) RETURN labels(n) AS labels LIMIT 1", {"qn": ref}
     ) or []
     if not rows:
         return None
@@ -217,8 +218,7 @@ def _make_owner_bridge(
             owner_label = cache[hop.to_owner_ref]
         elif loader is not None:
             rows = loader.execute_query_readonly(
-                "MATCH (n {qualified_name: $qn})"
-                " WHERE n:MetadataObject OR n:Command OR n:Form OR n:Configuration"
+                "MATCH (n:MetadataObject|Command|Form|Configuration {qualified_name: $qn})"
                 " RETURN labels(n)[0] AS label LIMIT 1",
                 {"qn": hop.to_owner_ref},
             ) or []
@@ -410,7 +410,7 @@ def _expand_calls_from_owner(
     """
     cfg_r = _cfg_and("r", config_name)
     rows = _run_query(loader, f"""
-MATCH (src {{qualified_name: $qn}})
+MATCH (src:{QN_LABEL_EXPR} {{qualified_name: $qn}})
       -[:HAS_MODULE|DECLARES]->(mod_or_r)
 WITH CASE WHEN mod_or_r:Module THEN mod_or_r ELSE null END AS mod,
      CASE WHEN mod_or_r:Routine THEN mod_or_r ELSE null END AS direct_r
@@ -515,7 +515,7 @@ def _expand_has_handler_downstream(
 ) -> List[TraversalStep]:
     cfg_r = _cfg_and("r", config_name)
     rows = _run_query(loader, f"""
-MATCH (src {{qualified_name: $qn}})-[:HAS_HANDLER]->(r:Routine)
+MATCH (src:{QN_LABEL_EXPR} {{qualified_name: $qn}})-[:HAS_HANDLER]->(r:Routine)
 WHERE r.project_name = $project_name{cfg_r}
 RETURN r.id AS ref, r.name AS name, r.owner_qn AS owner_qn
 """.strip(), {"qn": src_qn, "config_name": config_name}, project_name)
@@ -559,7 +559,7 @@ def _expand_uses_handler_downstream(
 ) -> List[TraversalStep]:
     cfg_r = _cfg_and("r", config_name)
     rows = _run_query(loader, f"""
-MATCH (src {{qualified_name: $qn}})-[:USES_HANDLER]->(r:Routine)
+MATCH (src:{QN_LABEL_EXPR} {{qualified_name: $qn}})-[:USES_HANDLER]->(r:Routine)
 WHERE r.project_name = $project_name{cfg_r}
 RETURN r.id AS ref, r.name AS name, r.owner_qn AS owner_qn
 """.strip(), {"qn": src_qn, "config_name": config_name}, project_name)
@@ -613,8 +613,8 @@ def _expand_form_binds_to_downstream(
     loader: Any, owner_qn: str, owner_label: str, project_name: str, config_name: Optional[str]
 ) -> List[TraversalStep]:
     """Flatten owner -> controls -> BINDS_TO target into a direct owner -> target step."""
-    rows = _run_query(loader, """
-MATCH (owner {qualified_name: $qn})-[:HAS_CONTROL]->(:FormControl)-[:HAS_CHILD*0..]->(fc:FormControl)-[:BINDS_TO]->(target)
+    rows = _run_query(loader, f"""
+MATCH (owner:{QN_LABEL_EXPR} {{qualified_name: $qn}})-[:HAS_CONTROL]->(:FormControl)-[:HAS_CHILD*0..]->(fc:FormControl)-[:BINDS_TO]->(target)
 WHERE (target:Attribute OR target:Dimension OR target:Resource
     OR target:FormAttribute OR target:MetadataObject)
 RETURN labels(target)[0] AS label, target.qualified_name AS ref, target.name AS name
@@ -634,8 +634,8 @@ def _expand_form_links_to_command_downstream(
     loader: Any, owner_qn: str, owner_label: str, project_name: str, config_name: Optional[str]
 ) -> List[TraversalStep]:
     """Flatten owner -> controls -> LINKS_TO_COMMAND into a direct owner -> Command step."""
-    rows = _run_query(loader, """
-MATCH (owner {qualified_name: $qn})-[:HAS_CONTROL]->(:FormControl)-[:HAS_CHILD*0..]->(fc:FormControl)-[:LINKS_TO_COMMAND]->(cmd:Command)
+    rows = _run_query(loader, f"""
+MATCH (owner:{QN_LABEL_EXPR} {{qualified_name: $qn}})-[:HAS_CONTROL]->(:FormControl)-[:HAS_CHILD*0..]->(fc:FormControl)-[:LINKS_TO_COMMAND]->(cmd:Command)
 RETURN cmd.qualified_name AS ref, cmd.name AS name
 """.strip(), {"qn": owner_qn, "config_name": config_name}, project_name)
     return [
@@ -657,15 +657,15 @@ def _expand_form_handler_downstream(
     commands) into direct owner -> Routine steps for rel in {HAS_HANDLER, USES_HANDLER}."""
     cfg_r = _cfg_and("r", config_name)
     rows = _run_query(loader, f"""
-MATCH (owner {{qualified_name: $qn}})-[:HAS_EVENT]->(:FormEvent)-[:HAS_EVENT_ACTION]->(:FormEventAction)-[:{rel}]->(r:Routine)
+MATCH (owner:{QN_LABEL_EXPR} {{qualified_name: $qn}})-[:HAS_EVENT]->(:FormEvent)-[:HAS_EVENT_ACTION]->(:FormEventAction)-[:{rel}]->(r:Routine)
 WHERE r.project_name = $project_name{cfg_r}
 RETURN r.id AS ref, r.name AS name, r.owner_qn AS owner_qn
 UNION
-MATCH (owner {{qualified_name: $qn}})-[:HAS_CONTROL]->(:FormControl)-[:HAS_CHILD*0..]->(:FormControl)-[:HAS_EVENT]->(:FormEvent)-[:HAS_EVENT_ACTION]->(:FormEventAction)-[:{rel}]->(r:Routine)
+MATCH (owner:{QN_LABEL_EXPR} {{qualified_name: $qn}})-[:HAS_CONTROL]->(:FormControl)-[:HAS_CHILD*0..]->(:FormControl)-[:HAS_EVENT]->(:FormEvent)-[:HAS_EVENT_ACTION]->(:FormEventAction)-[:{rel}]->(r:Routine)
 WHERE r.project_name = $project_name{cfg_r}
 RETURN r.id AS ref, r.name AS name, r.owner_qn AS owner_qn
 UNION
-MATCH (owner {{qualified_name: $qn}})-[:HAS_COMMAND]->(:Command)-[:{rel}]->(r:Routine)
+MATCH (owner:{QN_LABEL_EXPR} {{qualified_name: $qn}})-[:HAS_COMMAND]->(:Command)-[:{rel}]->(r:Routine)
 WHERE r.project_name = $project_name{cfg_r}
 RETURN r.id AS ref, r.name AS name, r.owner_qn AS owner_qn
 """.strip(), {"qn": owner_qn, "config_name": config_name}, project_name)
