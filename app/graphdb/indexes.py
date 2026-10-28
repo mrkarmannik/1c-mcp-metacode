@@ -626,6 +626,9 @@ class IndexManagementMixin:
                 # Console search: scope indexes for fallback CONTAINS path.
                 "CREATE INDEX idx_console_search_scope IF NOT EXISTS FOR (n:ConsoleSearchable) ON (n.project_name, n.config_name, n.console_search_section)",
                 "CREATE INDEX idx_console_search_project_section IF NOT EXISTS FOR (n:ConsoleSearchable) ON (n.project_name, n.console_search_section)",
+                # Одиночный индекс для clear_project — равенство по одному project_name составной индекс
+                # не обслуживает (NodeByLabelScan по 6 млн узлов на каждом проекте и каждой переиндексации).
+                "CREATE INDEX idx_console_search_project IF NOT EXISTS FOR (n:ConsoleSearchable) ON (n.project_name)",
             ]
 
             # 3) Fulltext indexes for flexible name search (Neo4j 5 requires index name)

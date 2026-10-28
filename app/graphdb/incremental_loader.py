@@ -605,6 +605,24 @@ class IncrementalLoaderMixin:
     # delete_configuration_scope — config-level аналог delete_object_subtree
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _graph_labels(session: Any) -> List[str]:
+        return [row[0] for row in session.run("CALL db.labels() YIELD label RETURN label").values()]
+
+    def _scope_counts_by_label(self, session: Any, params: Dict[str, Any]) -> List[List[Any]]:
+        """[[label, cnt], …] узлов extension scope по каждой метке (включая вторичные),
+        как давал исходный `UNWIND labels(n)` по label-free скану, но по метке."""
+        rows: List[List[Any]] = []
+        for label in self._graph_labels(session):
+            cnt = session.run(
+                f"MATCH (n:{_escape_label(label)})\nWHERE {_SCOPE_IDENTITY_PREDICATE}\n"
+                "RETURN count(n) AS cnt",
+                **params,
+            ).single()["cnt"]
+            if cnt:
+                rows.append([label, int(cnt)])
+        return rows
+
     def delete_configuration_scope(
         self,
         project_name: str,
@@ -660,13 +678,9 @@ class IncrementalLoaderMixin:
             # быть несколько меток (RoutineCodeUnit:BslCodeSearchUnit,
             # :ConsoleSearchable), и брать первую попавшуюся значило бы
             # надеяться на порядок.
-            discovered = session.run(
-                f"MATCH (n)\nWHERE {_SCOPE_IDENTITY_PREDICATE}\n"
-                "UNWIND labels(n) AS label\n"
-                "RETURN label, count(*) AS cnt\n"
-                "ORDER BY label",
-                **params,
-            ).values()
+            # По каждой метке графа вместо label-free `MATCH (n)` (полный скан
+            # общего графа); результат тот же — узел считается под каждой своей меткой.
+            discovered = self._scope_counts_by_label(session, params)
             labels = [row[0] for row in discovered]
             stats.labels_discovered = list(labels)
             if not labels:
@@ -710,12 +724,7 @@ class IncrementalLoaderMixin:
                     stats.deleted_by_label[label] = label_total
 
             # 3. Verification тем же предикатом.
-            remaining = session.run(
-                f"MATCH (n)\nWHERE {_SCOPE_IDENTITY_PREDICATE}\n"
-                "UNWIND labels(n) AS label\n"
-                "RETURN label, count(*) AS cnt",
-                **params,
-            ).values()
+            remaining = self._scope_counts_by_label(session, params)
             if remaining:
                 raise ExtensionScopeCleanupIncomplete(
                     config_qn, {row[0]: int(row[1]) for row in remaining}
@@ -725,16 +734,19 @@ class IncrementalLoaderMixin:
             # project-идентичности нет. Отнести их к проекту нельзя, поэтому
             # только диагностика — удалять по имени значило бы рисковать чужим
             # проектом.
-            orphans = session.run(
-                "MATCH (n)\n"
-                "WHERE n.config_name = $config_name\n"
-                "  AND n.project_name IS NULL\n"
-                "  AND n.qualified_name IS NULL\n"
-                "  AND n.owner_qn IS NULL\n"
-                "UNWIND labels(n) AS label\n"
-                "RETURN label, count(*) AS cnt",
-                config_name=config_name,
-            ).values()
+            orphans = []
+            for label in self._graph_labels(session):
+                cnt = session.run(
+                    f"MATCH (n:{_escape_label(label)})\n"
+                    "WHERE n.config_name = $config_name\n"
+                    "  AND n.project_name IS NULL\n"
+                    "  AND n.qualified_name IS NULL\n"
+                    "  AND n.owner_qn IS NULL\n"
+                    "RETURN count(n) AS cnt",
+                    config_name=config_name,
+                ).single()["cnt"]
+                if cnt:
+                    orphans.append([label, cnt])
             if orphans:
                 stats.legacy_orphans_by_label = {row[0]: int(row[1]) for row in orphans}
                 logger.warning(

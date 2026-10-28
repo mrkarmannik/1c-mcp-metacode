@@ -86,43 +86,46 @@ class QueryApiMixin:
             res = session.run("MATCH (r:Routine) WHERE r.project_name = $prj RETURN count(r) AS count", prj=prj)
             stats['Routine'] = res.single()['count']
 
-            # Relationships: between nodes of the project (by prefix) plus edges touching the Project node itself
-            rel_cypher = """
-            OPTIONAL MATCH (p:Project {name: $name})
-            WITH p
-            OPTIONAL MATCH (a)-[r]->(b)
-            WHERE
-              (
-                (
-                  (a.qualified_name IS NOT NULL AND a.qualified_name STARTS WITH $prefix)
-                  OR (a.project_name IS NOT NULL AND toLower(a.project_name) = toLower($name))
-                )
-                AND
-                (
-                  (b.qualified_name IS NOT NULL AND b.qualified_name STARTS WITH $prefix)
-                  OR (b.project_name IS NOT NULL AND toLower(b.project_name) = toLower($name))
-                )
-              )
-              OR (p IS NOT NULL AND (a = p OR b = p))
-            RETURN count(DISTINCT r) AS count
-            """
-            result = session.run(rel_cypher, name=prj, prefix=prefix)
-            rec = result.single()
-            stats['Relationships'] = (rec or {}).get('count', 0)
+            # Исходные `OPTIONAL MATCH (a)-[r]->(b)` и `OPTIONAL MATCH (n)` без меток
+            # просматривали все рёбра и узлы общего графа при каждом старте контейнера.
+            # Считаем от узлов проекта по меткам: metadata-метки — индекс qualified_name
+            # (STARTS WITH $prefix), Module/Routine/RoutineCodeUnit — по project_name.
+            # Условие принадлежности второго конца ребра — то же, что в исходном запросе.
+            res = session.run("MATCH (n:PredefinedItem) WHERE n.qualified_name STARTS WITH $prefix "
+                              "RETURN count(n) AS count", prefix=prefix)
+            stats['PredefinedItem'] = res.single()['count']
+            res = session.run("MATCH (u:RoutineCodeUnit) WHERE u.project_name = $prj RETURN count(u) AS count",
+                              prj=prj)
+            stats['RoutineCodeUnit'] = res.single()['count']
 
-            # Total nodes = project node (if exists) + nodes with project-qualified prefix
-            total_nodes_cypher = """
-            OPTIONAL MATCH (p:Project {name: $name})
-            WITH CASE WHEN p IS NULL THEN 0 ELSE 1 END AS projectCount
-            OPTIONAL MATCH (n)
-            WHERE
-              (n.qualified_name IS NOT NULL AND n.qualified_name STARTS WITH $prefix)
-              OR (n.project_name IS NOT NULL AND toLower(n.project_name) = toLower($name))
-            WITH projectCount, count(DISTINCT n) AS nodeCount
-            RETURN projectCount + nodeCount AS count
-            """
-            result = session.run(total_nodes_cypher, name=prj, prefix=prefix)
-            rec = result.single()
-            stats['TotalNodes'] = (rec or {}).get('count', 0)
+            other_in_project = (
+                "((b.qualified_name IS NOT NULL AND b.qualified_name STARTS WITH $prefix) "
+                "OR (b.project_name IS NOT NULL AND toLower(b.project_name) = toLower($name)))"
+            )
+            qn_labels = [t for t in node_types if t != 'Project'] + ['PredefinedItem']
+            rels = 0
+            for node_type in qn_labels:
+                res = session.run(
+                    f"MATCH (a:{node_type}) WHERE a.qualified_name STARTS WITH $prefix "
+                    f"MATCH (a)-[r]->(b) WHERE {other_in_project} RETURN count(r) AS count",
+                    prefix=prefix, name=prj)
+                rels += res.single()['count']
+            for node_type in ('Module', 'Routine', 'RoutineCodeUnit'):
+                res = session.run(
+                    f"MATCH (a:{node_type}) WHERE a.project_name = $name "
+                    f"MATCH (a)-[r]->(b) WHERE {other_in_project} RETURN count(r) AS count",
+                    prefix=prefix, name=prj)
+                rels += res.single()['count']
+            # Рёбра самого узла Project (у него нет qualified_name/project_name, поэтому
+            # выше они не учтены ни с одной стороны).
+            res = session.run("OPTIONAL MATCH (p:Project {name: $name})-[r]-() RETURN count(DISTINCT r) AS count",
+                              name=prj)
+            rels += res.single()['count']
+            stats['Relationships'] = rels
+
+            stats['TotalNodes'] = (
+                stats['Project'] + sum(stats[t] for t in qn_labels)
+                + stats['Module'] + stats['Routine'] + stats['RoutineCodeUnit']
+            )
 
             return stats

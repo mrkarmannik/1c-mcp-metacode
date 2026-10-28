@@ -84,55 +84,42 @@ class Neo4jClient:
         total_deleted = 0
 
         with self.driver.session(database=settings.neo4j_database) as session:
-            # Strategy 1: Delete nodes by project_name property (most common)
-            logger.info("Clearing project nodes by project_name property...")
-            while True:
-                result = session.run("""
-                    MATCH (n)
-                    WHERE n.project_name = $project_name
-                    WITH n LIMIT $batch_size
-                    DETACH DELETE n
-                    RETURN count(n) AS deleted
-                    """,
-                    project_name=project_name,
-                    batch_size=batch_size
-                )
-
-                record = result.single()
-                deleted = record['deleted'] if record else 0
-                total_deleted += deleted
-
-                if deleted > 0:
-                    logger.info("  Deleted %d nodes (total: %d)", deleted, total_deleted)
-
-                if deleted < batch_size:
-                    break
-
-            # Strategy 2: Delete nodes by qualified_name prefix
-            logger.info("Clearing project nodes by qualified_name prefix...")
+            # Strategies 1-2 (по project_name и по префиксу qualified_name) — по каждой
+            # метке графа. Исходный label-free `MATCH (n) ... LIMIT` просматривал
+            # весь общий граф на КАЖДЫЙ батч (O(узлы графа × батчи)); с меткой Neo4j
+            # берёт индексы qualified_name (уникальные у metadata-меток) и project_name
+            # (Module/Routine/MetadataObject), а метки без них сканирует в пределах
+            # метки. Условия принадлежности те же. Узел Project удаляется последним.
             prefix = project_name + '/'
-            while True:
-                result = session.run("""
-                    MATCH (n)
-                    WHERE n.qualified_name IS NOT NULL
-                      AND n.qualified_name STARTS WITH $prefix
-                    WITH n LIMIT $batch_size
-                    DETACH DELETE n
-                    RETURN count(n) AS deleted
-                    """,
-                    prefix=prefix,
-                    batch_size=batch_size
-                )
-
-                record = result.single()
-                deleted = record['deleted'] if record else 0
-                total_deleted += deleted
-
-                if deleted > 0:
-                    logger.info("  Deleted %d nodes (total: %d)", deleted, total_deleted)
-
-                if deleted < batch_size:
-                    break
+            labels = [
+                row[0] for row in session.run("CALL db.labels() YIELD label RETURN label").values()
+                if row[0] != "Project"
+            ]
+            # Ветки по метке выбираются по её индексам (clear_project_branches). Метка с
+            # индексом project_name и без индекса qualified_name (ConsoleSearchable, 6 млн узлов)
+            # чистится только по project_name: ветка STARTS WITH там была полным просмотром метки
+            # и ничего не находила — узлы уже удалены через основные метки.
+            qn_indexed, pn_indexed = _label_index_sets(session)
+            logger.info("Clearing project nodes by project_name / qualified_name prefix (%d labels)...",
+                        len(labels))
+            for label in labels:
+                escaped = "`" + label.replace("`", "``") + "`"
+                for where in clear_project_branches(label, qn_indexed, pn_indexed):
+                    label_deleted = 0
+                    while True:
+                        result = session.run(
+                            f"MATCH (n:{escaped}) WHERE {where} "
+                            "WITH n LIMIT $batch_size DETACH DELETE n RETURN count(n) AS deleted",
+                            project_name=project_name, prefix=prefix, batch_size=batch_size,
+                        )
+                        record = result.single()
+                        deleted = record['deleted'] if record else 0
+                        total_deleted += deleted
+                        label_deleted += deleted
+                        if deleted < batch_size:
+                            break
+                    if label_deleted:
+                        logger.info("  %s: deleted %d nodes (total: %d)", label, label_deleted, total_deleted)
 
             # Strategy 3: Delete nodes reachable from Project via graph traversal
             logger.info("Clearing project nodes by graph traversal...")
@@ -185,3 +172,40 @@ class Neo4jClient:
         if not self.driver:
             raise RuntimeError("Neo4j driver is not initialized")
         return self.driver
+
+
+CLEAR_PROJECT_BRANCHES = ("n.project_name = $project_name", "n.qualified_name STARTS WITH $prefix")
+
+
+def clear_project_branches(label: str, qn_indexed: set, pn_indexed: set) -> tuple:
+    """Условия удаления узлов метки в clear_project.
+
+    Обе ветки — для меток с индексом по qualified_name (STARTS WITH идёт по индексу) и для меток
+    без индексов (маленькие служебные метки, полный просмотр дёшев). Только project_name — для
+    меток с индексом по project_name без индекса qualified_name: это дублирующие метки вроде
+    ConsoleSearchable, их узлы уже удалены через основные метки, а STARTS WITH без индекса —
+    просмотр всей метки (6 млн узлов, секунды на каждом проекте и при каждой переиндексации).
+    """
+    if label in pn_indexed and label not in qn_indexed:
+        return CLEAR_PROJECT_BRANCHES[:1]
+    return CLEAR_PROJECT_BRANCHES
+
+
+def _label_index_sets(session) -> tuple:
+    """Метки с одиночным индексом по qualified_name и по project_name.
+
+    Только одиночные индексы: равенство по одному свойству планировщик по составному индексу
+    (`ConsoleSearchable(project_name, console_search_section)`) не ищет — остаётся просмотр метки.
+    """
+    qn_indexed, pn_indexed = set(), set()
+    rows = session.run(
+        "SHOW INDEXES YIELD labelsOrTypes, properties, entityType, type "
+        "WHERE entityType = 'NODE' AND type <> 'FULLTEXT' RETURN labelsOrTypes, properties"
+    ).values()
+    for labels, props in rows:
+        for lbl in labels or []:
+            if props == ["qualified_name"]:
+                qn_indexed.add(lbl)
+            if props == ["project_name"]:
+                pn_indexed.add(lbl)
+    return qn_indexed, pn_indexed
