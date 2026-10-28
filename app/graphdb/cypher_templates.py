@@ -970,11 +970,19 @@ ORDER BY r.file_path, r.id
 # Ordered by (rel_path, routine_id) to match the lightweight pass.
 # Used by Phase A streaming + prefetch and (resume) Phase A from cleaned
 # state.
+#
+# Условие курсора без дизъюнкции. В 2.0.1 оно было
+#   `file_path > $last OR (file_path = $last AND id > $last_id)`,
+# и планировщик строил Union: вторая ветка — просмотр уникального индекса Routine(id) по всем
+# проектам графа (у нас 8 млн узлов) на каждую страницу, 24 с на 1000 процедур. Эквивалентная
+# запись через `>=` и `NOT (...)` даёт одну ветку по индексу project_name. Основной путь фазы A
+# теперь вообще не пользуется этим запросом (см. BslCodeSearchIndexer._iter_routine_body_batches_by_order);
+# это запасной вариант, когда порядок процедур ещё не известен.
 CYPHER_FETCH_ROUTINES_BODY_BATCH = """
 MATCH (r:Routine)
 WHERE r.project_name = $project_name
-  AND (r.file_path > $last_rel_path
-       OR (r.file_path = $last_rel_path AND r.id > $last_routine_id))
+  AND r.file_path >= $last_rel_path
+  AND NOT (r.file_path = $last_rel_path AND r.id <= $last_routine_id)
 RETURN r.id AS routine_id,
        r.config_name AS config_name,
        r.name AS name,

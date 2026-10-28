@@ -34,6 +34,7 @@ Phase A stays committed, search falls back to RLM until next restart.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import dataclasses
 import enum
 import hashlib
@@ -738,6 +739,16 @@ _METADATA_WEIGHT = 6
 _METADATA_SYMBOL_WEIGHT = 1.0
 
 
+def routine_order_from_lightweight(rows: Iterable[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    """Порядок обхода процедур в фазе A — отсортированный список (rel_path, routine_id)
+    из lightweight-прохода. Сортировка в Python, а не доверие ORDER BY графа: курсор возобновления
+    (floor) сравнивается с этим же списком через bisect, и порядок должен быть один и тот же."""
+    order = [((r.get("rel_path") or "").strip(), r.get("routine_id") or "") for r in rows or ()]
+    order = [t for t in order if t[1]]
+    order.sort()
+    return order
+
+
 class BslCodeSearchIndexer:
     """Project-scope (project_name) BSL code indexer."""
 
@@ -745,6 +756,9 @@ class BslCodeSearchIndexer:
         self.driver = driver
         self.scope: str = settings.project_name
         self.sqlite: BslCodeSqlite = get_bsl_code_sqlite()
+        # Порядок (rel_path, routine_id) текущего прохода; задаётся после lightweight-выборки,
+        # фаза A читает тела по нему страницами id (см. _iter_routine_body_batches_by_order).
+        self._routine_order: Optional[List[Tuple[str, str]]] = None
         # Optional startup EmbeddingAvailability. When set with available=False,
         # Phase B / scoped Phase B skip the embedding call entirely (no bounded
         # or production probe) so a startup cycle can't hang on a dead endpoint.
@@ -831,6 +845,7 @@ class BslCodeSearchIndexer:
         current_fingerprint = self._compute_config_fingerprint()
         current_source_hash = self._compute_source_state_hash(lightweight)
         total_routines = len(lightweight)
+        self._routine_order = routine_order_from_lightweight(lightweight)
         stored = self.sqlite.read_fingerprint(scope)
         stored_fp = (stored.get("fingerprint") or "") if stored else ""
         stored_src = (stored.get("source_state_hash") or "") if stored else ""
@@ -1876,6 +1891,11 @@ class BslCodeSearchIndexer:
         (after it has been cleanup'd from SQLite).
         """
         size = int(settings.bsl_code_routine_fetch_batch_size)
+        order = self._routine_order
+        if order is not None:
+            yield from self._iter_routine_body_batches_by_order(order, floor, size)
+            return
+        # Запасной путь (порядок не известен): keyset-запрос с переписанным условием курсора.
         last_rel_path, last_routine_id = floor
         with self.driver.session(database=settings.neo4j_database) as session:
             while True:
@@ -1893,6 +1913,44 @@ class BslCodeSearchIndexer:
                 last = batch[-1]
                 last_rel_path = (last.get("file_path") or "").strip()
                 last_routine_id = last.get("routine_id") or ""
+
+    def _iter_routine_body_batches_by_order(
+        self, order: List[Tuple[str, str]], floor: Tuple[str, str], size: int,
+    ) -> Iterable[List[Dict[str, Any]]]:
+        """Тела процедур страницами по готовому списку (rel_path, routine_id).
+
+        В 2.0.1 каждая страница фазы A шла keyset-запросом с дизъюнкцией
+        `file_path > $last OR (file_path = $last AND id > $last_id)`. Планировщик Neo4j строит
+        для неё Union, вторая ветка которого — просмотр уникального индекса Routine(id) по ВСЕМ
+        проектам графа (8 млн узлов у нас) на каждую из сотен страниц: 24 с на 1000 процедур,
+        фаза A упиралась в Neo4j (рабочие процессы заняты на 10–15 %), а Neo4j часами держал
+        1–2 ядра на каждую первичную загрузку. Список процедур в нужном порядке уже получен
+        lightweight-проходом; страница по id — UNWIND + уникальный индекс, ~0,1 с.
+
+        Семантика курсора та же: отдаются процедуры строго после `floor` в порядке
+        (rel_path, routine_id); floor ("", "") — с начала, (path, "\uffff") — пропустить модуль
+        целиком, (path, "") — модуль с начала. Процедуры, исчезнувшие из графа между проходами,
+        пропускаются (keyset-запрос их тоже не вернул бы).
+        """
+        last_rel_path, last_routine_id = floor
+        cursor = ((last_rel_path or "").strip(), last_routine_id or "")
+        start = bisect.bisect_right(order, cursor)
+        step = max(1, int(size))
+        with self.driver.session(database=settings.neo4j_database) as session:
+            for i in range(start, len(order), step):
+                ids = [rid for _, rid in order[i:i + step]]
+                res = session.run(
+                    CYPHER_FETCH_ROUTINE_RECORDS_BY_IDS,
+                    routine_ids=ids,
+                    project_name=self.scope,
+                )
+                batch = [dict(record) for record in res]
+                if not batch:
+                    continue
+                # UNWIND сохраняет порядок id, но контракт потребителя — порядок (rel_path, id):
+                # закрепляем его явно, модульный агрегатор рассчитывает на смежность rel_path.
+                batch.sort(key=lambda r: ((r.get("file_path") or "").strip(), r.get("routine_id") or ""))
+                yield batch
 
     # ------------------------------------------------------------------ Phase B
 
