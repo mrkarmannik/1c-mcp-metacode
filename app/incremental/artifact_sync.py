@@ -2971,6 +2971,19 @@ class PostLinkingSync:
         if lease is not None:
             lease.heartbeat()
 
+        # ---- 2b. Подсистемы: ребро категории к вложенным ----
+        # Графы, загруженные до этой правки, держат вложенные подсистемы только под родителем; MERGE
+        # идемпотентный и после первого прохода возвращает 0. Созданные рёбра — counted
+        # Relationships, поэтому считаем их сигналом изменения графа (как EXTENDS_* выше).
+        try:
+            subsystem_edges = self.loader.repair_subsystem_category_edges(project) or 0
+        except Exception:
+            logger.exception("PostLinking: subsystem category edge repair failed")
+            subsystem_edges = 0
+        if subsystem_edges:
+            logger.info("PostLinking: subsystem category edges repaired: %d", subsystem_edges)
+        stats["subsystem_category_edges_created"] = subsystem_edges
+
         # ---- 3. Form-level extension relationships rebuild (per-form scope) ----
         if (
             impact.base_forms_with_changed_internals

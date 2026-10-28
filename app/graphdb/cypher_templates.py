@@ -52,9 +52,23 @@ ON CREATE SET
     m.category_name = row.category_name
 SET m += row.properties
 SET m:ConsoleSearchable
-FOREACH (_ IN CASE WHEN NOT (row.category_name = 'Подсистемы' AND row.properties.`РодительскаяПодсистема` IS NOT NULL) THEN [1] ELSE [] END |
-    MERGE (cat)-[:CONTAINS_OBJECT]->(m)
-)
+MERGE (cat)-[:CONTAINS_OBJECT]->(m)
+"""
+# В 2.0.1 вложенные подсистемы (`РодительскаяПодсистема`) не получали ребро от категории
+# «Подсистемы» — только от родителя (CYPHER_UPSERT_SUBSYSTEM_EDGE ниже). Все инструменты по категории
+# делают один шаг `(:MetadataCategory)-[:CONTAINS_OBJECT]->(m)` и вложенных не видели (issue #28;
+# у ERP 2.5 это 840 из 939 подсистем). Теперь ребро от категории есть у каждого уровня, иерархия
+# родитель → ребёнок сохраняется, вложенность читается из `ПутьПодсистемы`.
+
+# Ремонт графов, загруженных до этой правки — идемпотентно, по индексам
+# (MetadataObject(project_name, category_name) и уникальному qualified_name категории).
+CYPHER_REPAIR_SUBSYSTEM_CATEGORY_EDGES: Final[str] = """
+MATCH (m:MetadataObject {project_name: $project_name, category_name: 'Подсистемы'})
+WITH m, $project_name + '/' + m.config_name + '/Подсистемы' AS cat_qn
+MATCH (cat:MetadataCategory {qualified_name: cat_qn})
+WHERE NOT (cat)-[:CONTAINS_OBJECT]->(m)
+MERGE (cat)-[:CONTAINS_OBJECT]->(m)
+RETURN count(*) AS created
 """
 
 CYPHER_UPSERT_SUBSYSTEM_EDGE: Final[str] = """

@@ -18,6 +18,7 @@ from .cypher_templates import (
     CYPHER_UPSERT_CATEGORIES,
     CYPHER_UPSERT_METADATA_OBJECT,
     CYPHER_UPSERT_SUBSYSTEM_EDGE,
+    CYPHER_REPAIR_SUBSYSTEM_CATEGORY_EDGES,
     CYPHER_UPSERT_FORM,
     CYPHER_FORMS_DEFAULT_CLEANUP,
     CYPHER_UPSERT_COMMAND,
@@ -43,6 +44,17 @@ logger = logging.getLogger(__name__)
 
 class ConfigLoaderMixin:
     """Chunked loading of Configuration and all nested entities"""
+
+    def repair_subsystem_category_edges(self, project_name: str) -> int:
+        """Ребро MetadataCategory «Подсистемы» → подсистема для вложенных подсистем, загруженных до этой правки.
+
+        2.0.1 связывало с категорией только подсистемы верхнего уровня, вложенные висели под родителем,
+        и инструменты по категории (get_metadata objects, find_metadata_objects) их не видели. MERGE
+        идемпотентный: после первого прохода возвращает 0. Вызывается из PostLinkingSync каждый цикл.
+        """
+        with self.driver.session(database=settings.neo4j_database) as session:
+            rec = session.run(CYPHER_REPAIR_SUBSYSTEM_CATEGORY_EDGES, project_name=project_name).single()
+            return int(rec["created"]) if rec else 0
 
     def load_configurations(
         self,

@@ -729,6 +729,7 @@ class IncrementalLoadingScheduler(threading.Thread):
             post_linking_changed = bool(
                 (post_stats or {}).get("extends_relationships_created", 0)
                 or (post_stats or {}).get("common_module_local_calls_created", 0)
+                or (post_stats or {}).get("subsystem_category_edges_created", 0)
             )
         except Exception:
             logger.exception("Phase 4 (post-linking) failed")
