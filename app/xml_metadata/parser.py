@@ -577,6 +577,28 @@ def _attr_by_local_name(elem: ET.Element, name: str) -> str:
     return ""
 
 
+def _uuid_attr(elem: ET.Element | None) -> str:
+    """Атрибут uuid элемента метаданных: <Catalog uuid=…>, <Attribute uuid=…>, <Form uuid=…>."""
+    if elem is None:
+        return ""
+    return (elem.attrib.get("uuid") or _attr_by_local_name(elem, "uuid") or "").strip()
+
+
+def _with_meta_uuid(props: Dict[str, Any], elem: ET.Element | None) -> Dict[str, Any]:
+    """Положить uuid элемента в props["meta_uuid"] — тот же GUID, что id в ConfigDumpInfo.xml.
+
+    Источник GUID для выгрузок без ConfigDumpInfo.xml и для видов
+    метаданных, которых нет в RU_TO_XCF_PREFIX (xcf_utils). Ключ входит в INTERNAL_HASH_KEYS
+    (incremental/hashing.py): хеш объекта от него не зависит, существующие проекты при обновлении
+    образа не перепарсиваются. _enrich_guids (ConfigDumpInfo.xml) уже стоящий meta_uuid не трогает,
+    а наложение базы на заимствованные объекты расширения его не копирует (OVERLAY_SKIP_PROPS).
+    """
+    uuid = _uuid_attr(elem)
+    if uuid:
+        props["meta_uuid"] = uuid
+    return props
+
+
 def _fill_value(prop: ET.Element) -> str:
     if _attr_by_local_name(prop, "nil") == "true":
         return ""
@@ -1216,7 +1238,7 @@ def _parse_attribute(
     owner_folder: str | None = None,
     xml_version: str | None = None,
 ) -> Dict[str, Any]:
-    props = _normalized_properties(elem, type_key=type_key, folder=owner_folder)
+    props = _with_meta_uuid(_normalized_properties(elem, type_key=type_key, folder=owner_folder), elem)
     fill_value = props.get("ЗначениеЗаполнения")
     if (
         type_key in {"attribute", "dimension", "resource", "tabular_section_attribute"}
@@ -1256,7 +1278,7 @@ def _parse_attribute(
 
 
 def _parse_tabular(elem: ET.Element, fallback: str, owner_folder: str | None = None, owner_name: str | None = None, xml_version: str | None = None) -> Dict[str, Any]:
-    props = _normalized_properties(elem, type_key="tabular_section")
+    props = _with_meta_uuid(_normalized_properties(elem, type_key="tabular_section"), elem)
     tabular_name = _name_from_props(props, fallback)
     attrs = []
     child_objects = _first_child(elem, "ChildObjects")
@@ -1521,7 +1543,7 @@ def parse_descriptor(payload: Tuple[str, ...]) -> Dict[str, Any]:
 
         external_form_context = _external_ds_container_form_context(rel_parts)
         if external_form_context:
-            props = _normalized_properties(md, type_key="form")
+            props = _with_meta_uuid(_normalized_properties(md, type_key="form"), md)
             return {
                 "kind": "external_ds_container_form",
                 "owner_name": external_form_context["owner_name"],
@@ -1533,7 +1555,7 @@ def parse_descriptor(payload: Tuple[str, ...]) -> Dict[str, Any]:
             }
 
         if is_child_form:
-            props = _normalized_properties(md, type_key="form")
+            props = _with_meta_uuid(_normalized_properties(md, type_key="form"), md)
             return {
                 "kind": "child_form",
                 "owner_folder": rel_parts[0],
@@ -1542,7 +1564,7 @@ def parse_descriptor(payload: Tuple[str, ...]) -> Dict[str, Any]:
                 "properties": props,
             }
         if is_child_template:
-            props = _normalized_properties(md, type_key="template")
+            props = _with_meta_uuid(_normalized_properties(md, type_key="template"), md)
             return {
                 "kind": "child_template",
                 "owner_folder": rel_parts[0],
@@ -1551,7 +1573,7 @@ def parse_descriptor(payload: Tuple[str, ...]) -> Dict[str, Any]:
                 "properties": props,
             }
         if is_child_command:
-            props = _normalized_properties(md, type_key="command")
+            props = _with_meta_uuid(_normalized_properties(md, type_key="command"), md)
             return {
                 "kind": "child_command",
                 "owner_folder": rel_parts[0],
@@ -1561,7 +1583,7 @@ def parse_descriptor(payload: Tuple[str, ...]) -> Dict[str, Any]:
             }
 
         if len(rel_parts) == 1 and rel_parts[0] == "Configuration.xml":
-            props = _normalize_configuration_props(_normalized_properties(md))
+            props = _with_meta_uuid(_normalize_configuration_props(_normalized_properties(md)), md)
             return {"kind": "configuration", "name": name, "properties": props}
 
         external_ds_context = _external_ds_descriptor_context(rel_parts, md_kind)
@@ -1583,7 +1605,7 @@ def parse_descriptor(payload: Tuple[str, ...]) -> Dict[str, Any]:
         category = FOLDER_TO_RU_CATEGORY.get(folder)
         if not category:
             return {"kind": "skip", "reason": f"unknown_folder_{folder}"}
-        props = _normalized_properties(md, folder=folder)
+        props = _with_meta_uuid(_normalized_properties(md, folder=folder), md)
         if folder == "ChartsOfAccounts":
             props.setdefault("АвтоПорядокПоКоду", "Истина")
             if "ДлинаПорядка" not in props and props.get("ДлинаКода") not in (None, "", []):
@@ -1661,10 +1683,10 @@ def parse_descriptor(payload: Tuple[str, ...]) -> Dict[str, Any]:
             elif child_name == "ExtDimensionAccountingFlag":
                 obj["subconto_flags"].append(_parse_attribute(child, "", "ext_dimension_accounting_flag", owner_folder=folder, xml_version=xml_version))
             elif child_name == "EnumValue":
-                ev_props = _normalized_properties(child, type_key="enum_value")
+                ev_props = _with_meta_uuid(_normalized_properties(child, type_key="enum_value"), child)
                 obj["enum_values"].append({"name": _name_from_props(ev_props, ""), "properties": ev_props})
             elif child_name == "Command":
-                cmd_props = _normalized_properties(child, type_key="command")
+                cmd_props = _with_meta_uuid(_normalized_properties(child, type_key="command"), child)
                 obj["commands"].append({"name": _name_from_props(cmd_props, ""), "properties": cmd_props})
             elif child_name == "Form":
                 form_name = _text(child)

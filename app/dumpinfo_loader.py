@@ -31,7 +31,7 @@ def load_dumpinfo_map(code_dir: Path) -> Dict[str, str]:
 
     xml_path = code_dir / "ConfigDumpInfo.xml"
     if not xml_path.exists():
-        logger.info("ConfigDumpInfo.xml not found under %s (GUID enrichment skipped)", code_dir)
+        logger.info("ConfigDumpInfo.xml not found under %s (GUIDs come from uuid attributes of object XML)", code_dir)
         return {}
 
     mapping: Dict[str, str] = {}

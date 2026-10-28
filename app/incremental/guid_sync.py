@@ -149,6 +149,17 @@ class GuidIncrementalSync:
         2. Для каждой row сравнить current_guid vs new_map.get(xcf_name) → SET/REMOVE/skip.
         3. После Neo4j apply — обновить guid_state.current_guid и source_manifest.
         """
+        if file_stats is None:
+            # ConfigDumpInfo.xml исчез (например, проект перешёл на выгрузку из git без него).
+            # meta_uuid на узлах теперь ставит разбор XML (атрибут uuid, см. xml_metadata/parser.py),
+            # снимать их нельзя; manifest удаляем, чтобы scope не считался изменившимся каждый цикл.
+            state.delete_source_manifest("guid", [scope])
+            logger.info(
+                "GUID scoped refresh: scope=%s — ConfigDumpInfo.xml отсутствует, "
+                "GUID берутся из атрибутов uuid в XML объектов", scope,
+            )
+            return
+
         eligible = state.get_guid_state_for_scope(scope)
         if not eligible:
             # Если baseline ещё не записан (первый incremental без full reload baseline),
@@ -156,10 +167,11 @@ class GuidIncrementalSync:
             self._update_manifest(state, scope, file_stats)
             return
 
-        # diff
+        # diff. Только SET: записи, которых в ConfigDumpInfo.xml нет, не повод снимать meta_uuid —
+        # его мог поставить разбор XML (атрибут uuid), а узлы удалённых объектов убирает metadata sync.
         set_rows: Dict[str, List[Dict[str, str]]] = {}  # label -> [{qn, meta_uuid}]
-        remove_rows: Dict[str, List[Dict[str, str]]] = {}  # label -> [{qn}]
         updates: List[Tuple[str, str, Optional[str]]] = []  # (label, qn, new_guid)
+        absent = 0
 
         for row in eligible:
             label = row["label"]
@@ -170,30 +182,22 @@ class GuidIncrementalSync:
             if current == new_guid:
                 continue
             if new_guid is None:
-                # removed
-                remove_rows.setdefault(label, []).append({"qn": qn})
-                updates.append((label, qn, None))
-            else:
-                # added or changed
-                set_rows.setdefault(label, []).append({"qn": qn, "meta_uuid": new_guid})
-                updates.append((label, qn, new_guid))
+                absent += 1
+                continue
+            # added or changed
+            set_rows.setdefault(label, []).append({"qn": qn, "meta_uuid": new_guid})
+            updates.append((label, qn, new_guid))
 
-        if not set_rows and not remove_rows:
+        if absent:
+            logger.debug("GUID scoped refresh: scope=%s — %d узлов без записи в ConfigDumpInfo.xml, "
+                         "meta_uuid оставлен", scope, absent)
+        if not set_rows:
             self._update_manifest(state, scope, file_stats)
             return
 
         try:
             session_db = getattr(settings, "neo4j_database", None)
             with loader.driver.session(database=session_db) as session:
-                for label, rows in remove_rows.items():
-                    session.run(
-                        f"UNWIND $rows AS row "
-                        f"MATCH (n:`{label}` {{qualified_name: row.qn, "
-                        f"project_name: $project_name}}) "
-                        f"REMOVE n.meta_uuid",
-                        rows=rows,
-                        project_name=settings.project_name,
-                    )
                 for label, rows in set_rows.items():
                     session.run(
                         f"UNWIND $rows AS row "
@@ -214,10 +218,10 @@ class GuidIncrementalSync:
             self._update_manifest(state, scope, file_stats)
 
         logger.info(
-            "GUID scoped refresh: scope=%s set=%d removed=%d",
+            "GUID scoped refresh: scope=%s set=%d absent_in_dumpinfo=%d",
             scope,
             sum(len(v) for v in set_rows.values()),
-            sum(len(v) for v in remove_rows.values()),
+            absent,
         )
 
     @staticmethod
