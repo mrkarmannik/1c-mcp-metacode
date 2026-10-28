@@ -5,11 +5,22 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 import logging
+import os
 
+from neo4j import unit_of_work
 from neo4j.exceptions import Neo4jError
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+# Потолок времени read-запросов (инструменты MCP, веб-консоль, служебные чтения).
+# Neo4j сам прерывает транзакцию по таймауту, и один тяжёлый запрос не грузит общий граф
+# всех проектов минутами. 0 — без ограничения (как в исходном 2.0.1).
+try:
+    _READ_TX_TIMEOUT_SEC = float(os.environ.get("READ_QUERY_TIMEOUT_SEC", "120"))
+except ValueError:
+    logger.warning("READ_QUERY_TIMEOUT_SEC is not a number; using 120 s")
+    _READ_TX_TIMEOUT_SEC = 120.0
 
 
 class QueryApiMixin:
@@ -32,10 +43,14 @@ class QueryApiMixin:
                 def _work(tx):
                     res = tx.run(cypher_query, parameters or {})
                     return [dict(r) for r in res]
+                if _READ_TX_TIMEOUT_SEC > 0:
+                    _work = unit_of_work(timeout=_READ_TX_TIMEOUT_SEC)(_work)
+                # Функция передаётся сама, без lambda-обёртки: таймаут unit_of_work драйвер
+                # читает с атрибутов переданной функции.
                 try:
-                    return session.execute_read(lambda tx: _work(tx))  # neo4j 5+
+                    return session.execute_read(_work)  # neo4j 5+
                 except AttributeError:
-                    return session.read_transaction(lambda tx: _work(tx))  # neo4j 4.x
+                    return session.read_transaction(_work)  # neo4j 4.x
         except Neo4jError as e:
             logger.error("Read-only query execution failed: %s", str(e))
             raise
