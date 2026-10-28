@@ -43,20 +43,38 @@ class CallsitesResolver:
         Returns:
             Tuple of (call_rows, sorted_caller_ids)
         """
-        logger.info("Resolving %d callsites against %d routines...", len(callsites), len(routines_indexes))
+        return self.resolve_prepared(self.prepare(routines_indexes), callsites, project_name)
 
-        # Build indexes
-        routine_by_id = self._build_routine_index(routines_indexes)
-        module_id_by_rid = self._build_module_index(routines_indexes)
+    def prepare(self, routines_indexes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Строит индексы корпуса один раз — для резолва callsites порциями."""
         arity_by_rid = self._build_arity_index(routines_indexes)
-
-        # Build lookup structures
-        namesig_by_module = self._build_module_lookups(routines_indexes, arity_by_rid)
-
         common_owner_by_name, commons_sig_by_owner_and_name = \
             self._build_common_module_lookups(routines_indexes, arity_by_rid)
+        return {
+            "routines_count": len(routines_indexes),
+            "routine_by_id": self._build_routine_index(routines_indexes),
+            "module_id_by_rid": self._build_module_index(routines_indexes),
+            "namesig_by_module": self._build_module_lookups(routines_indexes, arity_by_rid),
+            "common_owner_by_name": common_owner_by_name,
+            "commons_sig_by_owner_and_name": commons_sig_by_owner_and_name,
+            "mgr_by_cat_obj_name": self._build_manager_lookups(routines_indexes, arity_by_rid),
+        }
 
-        mgr_by_cat_obj_name = self._build_manager_lookups(routines_indexes, arity_by_rid)
+    def resolve_prepared(
+        self,
+        prepared: Dict[str, Any],
+        callsites: List[Dict[str, Any]],
+        project_name: str
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Как `resolve_calls`, но по индексам из `prepare`."""
+        logger.info("Resolving %d callsites against %d routines...", len(callsites), prepared["routines_count"])
+
+        routine_by_id = prepared["routine_by_id"]
+        module_id_by_rid = prepared["module_id_by_rid"]
+        namesig_by_module = prepared["namesig_by_module"]
+        common_owner_by_name = prepared["common_owner_by_name"]
+        commons_sig_by_owner_and_name = prepared["commons_sig_by_owner_and_name"]
+        mgr_by_cat_obj_name = prepared["mgr_by_cat_obj_name"]
 
         # Resolve callsites
         callers_set: Set[str] = set()
@@ -108,9 +126,23 @@ class CallsitesResolver:
         """Build routine_id -> routine dictionary"""
         return {r.get("id"): r for r in routines if r.get("id")}
 
+    @staticmethod
+    def _module_key(r: Dict[str, Any]) -> Optional[str]:
+        """Ключ модуля процедуры для локальных вызовов.
+
+        Процедуры общих модулей идут без узла Module (`module_id` = None, см. bsl_signature_scanner),
+        поэтому их модуль — сам общий модуль, `owner_qn`. Без этого вызов без префикса внутри общего
+        модуля не находил цель.
+        """
+        module_id = r.get("module_id")
+        if module_id:
+            return module_id
+        owner_qn = r.get("owner_qn")
+        return f"owner:{owner_qn}" if owner_qn else None
+
     def _build_module_index(self, routines: List[Dict[str, Any]]) -> Dict[str, Optional[str]]:
-        """Build routine_id -> module_id dictionary"""
-        return {r.get("id"): r.get("module_id") for r in routines if r.get("id")}
+        """Build routine_id -> module key dictionary (см. `_module_key`)"""
+        return {r.get("id"): self._module_key(r) for r in routines if r.get("id")}
 
     def _build_arity_index(self, routines: List[Dict[str, Any]]) -> Dict[str, Tuple[int, int]]:
         """
@@ -159,7 +191,7 @@ class CallsitesResolver:
         Build the module-based signature lookup.
 
         Returns:
-            namesig_by_module: module_id -> name_low -> [(rid, min_a, max_a, directives), ...]
+            namesig_by_module: module key -> name_low -> [(rid, min_a, max_a, directives), ...]
         """
         namesig_by_module: Mapping[str, Mapping[str, List[Tuple[str, int, int, List[str]]]]] = \
             defaultdict(lambda: defaultdict(list))
@@ -169,9 +201,9 @@ class CallsitesResolver:
             if not rid:
                 continue
 
-            module_id = r.get("module_id")
+            module_id = self._module_key(r)
             if not module_id:
-                continue  # CommonModule routines handled separately
+                continue
 
             name_low = self._name_low(r.get("name") or "")
             directives = r.get("directives", [])

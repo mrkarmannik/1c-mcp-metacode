@@ -726,7 +726,10 @@ class IncrementalLoadingScheduler(threading.Thread):
             post_stats = post.run(settings_obj=self.settings_obj, context=context, lease=lease)
             # stage-2 idempotent EXTENDS_* repair мог создать counted Relationships без
             # свежего diff'а — фактически созданные рёбра сигналят об изменении графа.
-            post_linking_changed = bool((post_stats or {}).get("extends_relationships_created", 0))
+            post_linking_changed = bool(
+                (post_stats or {}).get("extends_relationships_created", 0)
+                or (post_stats or {}).get("common_module_local_calls_created", 0)
+            )
         except Exception:
             logger.exception("Phase 4 (post-linking) failed")
         lease.heartbeat()

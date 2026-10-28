@@ -52,6 +52,10 @@ ART_BASE_EVENT_SUBSCRIPTION = "artifact:base:event_subscription"
 ART_BASE_RIGHTS = "artifact:base:rights"
 ART_BASE_BSL = "artifact:base:bsl"
 
+# Отметка разового пересчёта CALLS процедур общих модулей и размер порции.
+REPAIR_CM_LOCAL_CALLS_MARKER = "common_module_local_calls"
+REPAIR_CM_CALLS_CHUNK_CALLSITES = 50_000
+
 
 def ext_artifact_scope(mode: str, ext_dir: str, kind: str) -> str:
     return f"artifact:ext:{mode}:{ext_dir}:{kind}"
@@ -2997,8 +3001,117 @@ class PostLinkingSync:
             lease=lease,
         )
 
+        # ---- 5. Вызовы внутри общих модулей: разовый пересчёт ----
+        # Раньше резолвер не находил цель вызова без префикса в общем модуле. Scoped CALLS выше
+        # пересчитывает только затронутых вызывающих, поэтому старые графы чинятся отдельным
+        # проходом по всем процедурам общих модулей; отметка в state — после успешного прохода.
+        try:
+            cm_local_edges = self._repair_common_module_calls(
+                settings_obj=settings_obj, context=context, lease=lease,
+            )
+        except Exception:
+            logger.exception("PostLinking: common module calls repair failed")
+            cm_local_edges = 0
+        stats["common_module_local_calls_created"] = cm_local_edges
+
         _log_post_linking_summary(context, stats)
         return stats
+
+    def _repair_common_module_calls(
+        self,
+        *,
+        settings_obj: Any,
+        context: CodeArtifactCycleContext,
+        lease: Optional[LockLease],
+    ) -> int:
+        """Пересчитать CALLS всех процедур общих модулей один раз; вернуть число локальных рёбер.
+
+        Корпус целей — routines_index всех BSL-артефактов (база + расширения), как в scoped CALLS.
+        Callsites читаются потоково и только у процедур общих модулей; резолв и запись — порциями
+        по файлам, чтобы вызовы одной процедуры не делились между порциями (load_bsl_calls сначала
+        удаляет исходящие CALLS вызывающих порции). Прерванный проход повторится целиком в
+        следующем цикле: удаление + MERGE идемпотентны.
+        """
+        if self.state.get_repair_marker(REPAIR_CM_LOCAL_CALLS_MARKER):
+            return 0
+        started = time.monotonic()
+        try:
+            done = self._recompute_common_module_calls(
+                settings_obj=settings_obj, context=context, lease=lease,
+            )
+        finally:
+            # корпус и callsites уже освобождены — вернуть ОС память пика (как после Phase A)
+            from runtime_memory import trim_process_memory
+
+            trim_process_memory(
+                "common module calls repair",
+                enabled=getattr(settings_obj, "memory_trim_enabled", True),
+            )
+        if done is None:
+            return 0  # нет BSL baseline — отметку не ставим, проход повторится после него
+        callers_total, local_edges = done
+        self.state.set_repair_marker(REPAIR_CM_LOCAL_CALLS_MARKER)
+        logger.info(
+            "PostLinking: common module calls recomputed: callers=%d local_edges=%d in %.1fs",
+            callers_total, local_edges, time.monotonic() - started,
+        )
+        return local_edges
+
+    def _recompute_common_module_calls(
+        self,
+        *,
+        settings_obj: Any,
+        context: CodeArtifactCycleContext,
+        lease: Optional[LockLease],
+    ) -> Optional[Tuple[int, int]]:
+        """Тело пересчёта: (вызывающих, локальных рёбер) или None без BSL baseline."""
+        source_mode = getattr(settings_obj, "metadata_source", "txt")
+        scopes: List[str] = [ART_BASE_BSL]
+        for ext_dir_name in sorted(context.known_extension_configs.keys()):
+            scopes.append(ext_artifact_scope(source_mode, ext_dir_name, "bsl"))
+
+        routines_indexes: List[Dict[str, Any]] = []
+        cm_files: List[List[Dict[str, Any]]] = []
+        for scope in scopes:
+            for _rel_path, routines_index, callsites in self.state.iter_bsl_routines_and_callsites(scope):
+                routines_indexes.extend(routines_index)
+                cm_ids = {
+                    r.get("id") for r in routines_index
+                    if r.get("id") and not r.get("module_id") and r.get("module_type") == "CommonModule"
+                }
+                if cm_ids:
+                    own = [cs for cs in callsites if cs.get("caller_id") in cm_ids]
+                    if own:
+                        cm_files.append(own)
+        if not routines_indexes:
+            return None
+        if lease is not None:
+            lease.heartbeat()
+
+        from indexer.callsites_resolver import CallsitesResolver
+
+        resolver = CallsitesResolver()
+        prepared = resolver.prepare(routines_indexes)
+        project = context.project_name
+        local_edges = 0
+        callers_total = 0
+
+        def _flush(chunk: List[Dict[str, Any]]) -> None:
+            nonlocal local_edges, callers_total
+            rows, callers = resolver.resolve_prepared(prepared, chunk, project)
+            self.loader.load_bsl_calls(project, rows, callers, lease=lease)
+            local_edges += sum(1 for row in rows if row.get("kind") != "qualified")
+            callers_total += len(callers)
+
+        chunk: List[Dict[str, Any]] = []
+        for file_callsites in cm_files:
+            chunk.extend(file_callsites)
+            if len(chunk) >= REPAIR_CM_CALLS_CHUNK_CALLSITES:
+                _flush(chunk)
+                chunk = []
+        if chunk:
+            _flush(chunk)
+        return callers_total, local_edges
 
     def _scoped_calls(
         self,

@@ -206,6 +206,15 @@ CREATE TABLE IF NOT EXISTS extension_scope_cleanup (
     bsl_fallback_reason TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (project_name, source_scope, config_qn)
 );
+
+-- Отметки разовых ремонтов графа (вызовы внутри общих модулей). Отдельная таблица,
+-- а не stage_state: строка там меняла бы has_any_baseline() и проверки baseline планировщика.
+CREATE TABLE IF NOT EXISTS repair_markers (
+    project_name TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    done_at      INTEGER NOT NULL,
+    PRIMARY KEY (project_name, name)
+);
 """
 
 # Стадии cleanup — монотонные, назад не откатываются.
@@ -1887,6 +1896,35 @@ class IncrementalLoadingState:
                 "form_links": json.loads(r[7]),
             })
         return out
+
+    def iter_bsl_routines_and_callsites(
+        self, source_scope: str
+    ) -> Iterator[Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]]:
+        """(rel_path, routines_index, callsites) по одному файлу — без списка всего scope в памяти."""
+        conn = self._connect()
+        cur = conn.execute(
+            "SELECT rel_path, routines_index_json, callsites_json "
+            "FROM bsl_file_artifacts "
+            "WHERE project_name=? AND source_scope=?",
+            (self.project_name, source_scope),
+        )
+        for r in cur:
+            yield r[0], json.loads(r[1]), json.loads(r[2])
+
+    def get_repair_marker(self, name: str) -> Optional[int]:
+        """Время отметки разового ремонта (unix) или None, если ремонт ещё не завершён."""
+        row = self._connect().execute(
+            "SELECT done_at FROM repair_markers WHERE project_name=? AND name=?",
+            (self.project_name, name),
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_repair_marker(self, name: str) -> None:
+        self._connect().execute(
+            "INSERT INTO repair_markers (project_name, name, done_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(project_name, name) DO UPDATE SET done_at=excluded.done_at",
+            (self.project_name, name, int(time.time())),
+        )
 
     def upsert_bsl_file_artifact(
         self,
