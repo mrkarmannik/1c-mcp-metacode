@@ -1697,10 +1697,12 @@ def xml_full_scan_run_extensions(
             _xml_full_scan_one_scope(
                 loader=loader,
                 state=state,
+                settings_obj=settings_obj,
                 report=sub_report,
                 project_name=project_name,
                 code_directory=code_directory,
                 source_scope=scope,
+                ext_dir_name=ext_dir_name,
                 ext_code_dir=ext_code_dir,
                 ext_graph_config_name=ext_graph_config_name,
                 base_cfg_name=base_cfg_name,
@@ -1715,17 +1717,23 @@ def _xml_full_scan_one_scope(
     *,
     loader: Any,
     state: IncrementalLoadingState,
+    settings_obj: Any,
     report: IncrementalReport,
     project_name: str,
     code_directory: Path,
     source_scope: str,
+    ext_dir_name: str,
     ext_code_dir: Path,
     ext_graph_config_name: str,
     base_cfg_name: str,
     xml_context: Optional[XmlCycleContext] = None,
 ) -> None:
     """Full scan одного scope расширения. Параллель `xml_full_scan_run`,
-    но scoped: никаких `_parse_xml_full` ни базы, ни расширения."""
+    но scoped: никаких `_parse_xml_full` ни базы, ни расширения.
+
+    `settings_obj` и `ext_dir_name` приходят параметрами: раньше имена брались из
+    объемлющей области, которой у функции нет, и первый же scope с удалёнными файлами
+    падал с NameError в блоке GUID map — удалённые из расширения объекты оставались в графе."""
     # 1. Missing paths.
     manifest_paths = set(state.all_source_manifest_rel_paths(source_scope))
     if not manifest_paths:
