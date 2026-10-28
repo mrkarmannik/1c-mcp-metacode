@@ -451,16 +451,44 @@ def _files_for_object(
 
     Использует обратный mapping через `_resolve_owner_object_qn`.
     """
-    result: List[Path] = []
+    # Обратный индекс owner_qn -> файлы строится один раз на набор файлов, а не
+    # на каждый объект. Исходный перебор всех descriptors для каждого объекта давал
+    # O(объекты × файлы): 1910 × 20 884 на крупном обновлении УТ — 27 минут CPU.
+    index = _owner_files_index(code_directory, metadata_xml_files, project_name, config_name)
+    return list(index.get(object_qn, ()))
+
+
+_OWNER_FILES_INDEX_CACHE: Dict[Tuple[Any, ...], Dict[Optional[str], List[Path]]] = {}
+_OWNER_FILES_INDEX_CACHE_MAX = 4
+
+
+def _owner_files_index(
+    code_directory: Path,
+    metadata_xml_files: List[Path],
+    project_name: str,
+    config_name: str,
+) -> Dict[Optional[str], List[Path]]:
+    """owner_qn -> XML descriptors в порядке metadata_xml_files (как в исходном переборе).
+
+    Ключ кэша — сам набор путей (tuple): `_resolve_owner_object_qn` зависит только от
+    относительного пути, проекта и конфигурации, содержимое файлов на результат не влияет.
+    """
+    key = (str(code_directory), project_name, config_name, tuple(metadata_xml_files))
+    index = _OWNER_FILES_INDEX_CACHE.get(key)
+    if index is not None:
+        return index
+    index: Dict[Optional[str], List[Path]] = {}
     for xml_path in metadata_xml_files:
         try:
             rel_path = str(xml_path.relative_to(code_directory)).replace("\\", "/")
         except ValueError:
             continue
         owner_qn = _resolve_owner_object_qn(rel_path, project_name, config_name)
-        if owner_qn == object_qn:
-            result.append(xml_path)
-    return result
+        index.setdefault(owner_qn, []).append(xml_path)
+    if len(_OWNER_FILES_INDEX_CACHE) >= _OWNER_FILES_INDEX_CACHE_MAX:
+        _OWNER_FILES_INDEX_CACHE.pop(next(iter(_OWNER_FILES_INDEX_CACHE)))
+    _OWNER_FILES_INDEX_CACHE[key] = index
+    return index
 
 
 # --------------------------------------------------------------------
@@ -1041,16 +1069,9 @@ def _files_for_object_in_dir(
 ) -> List[Path]:
     """Аналог `_files_for_object`, но через `_resolve_owner_object_qn` с конкретным
     `config_name` (имя расширения с `$ext$`)."""
-    result: List[Path] = []
-    for xml_path in metadata_xml_files:
-        try:
-            rel_path = str(xml_path.relative_to(code_directory)).replace("\\", "/")
-        except ValueError:
-            continue
-        owner_qn = _resolve_owner_object_qn(rel_path, project_name, config_name)
-        if owner_qn == object_qn:
-            result.append(xml_path)
-    return result
+    # Тот же обратный индекс, что и в `_files_for_object` (цикл по объектам расширения).
+    index = _owner_files_index(code_directory, metadata_xml_files, project_name, config_name)
+    return list(index.get(object_qn, ()))
 
 
 def xml_incremental_run_extensions(
