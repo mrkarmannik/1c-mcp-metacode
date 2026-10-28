@@ -762,7 +762,7 @@ class BslCodeSearchService:
                 "BSL search: sidecar miss for vector candidates %s; requesting reindex",
                 missing_meta_ids[:10],
             )
-            self.sqlite.request_reindex(scope)
+            self.sqlite.request_reindex(self.scope)
             drop = set(missing_meta_ids)
             candidates = [c for c in candidates if c.unit_id not in drop]
             if not candidates:
