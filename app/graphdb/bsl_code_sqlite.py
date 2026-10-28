@@ -3902,6 +3902,20 @@ class BslCodeSqlite:
 
     # ---------------------------------------------------------- scoped helpers
 
+    def routine_rel_paths_in_epoch(self, scope: str, epoch: int) -> Dict[str, str]:
+        """routine_id -> rel_path всех процедур эпохи (по units). Для сверки индекса
+        с графом; ~0.5 с на 600 тыс. строк."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT routine_id, rel_path FROM bsl_code_units "
+                "WHERE project_name = ? AND index_epoch = ?",
+                (scope, int(epoch)),
+            ).fetchall()
+        out: Dict[str, str] = {}
+        for rid, rel in rows:
+            out.setdefault(rid, rel or "")
+        return out
+
     def get_current_epoch(self, scope: str) -> Optional[int]:
         with self._lock:
             row = self._conn.execute(

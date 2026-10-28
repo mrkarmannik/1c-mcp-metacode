@@ -3510,6 +3510,10 @@ class BslCodeSearchSync:
             return result in _POST_MUTATION
 
         delta = getattr(context, "code_search_delta", None)
+        # Процедуры, оставшиеся в индексе после удаления из графа, — в ledger как deleted.
+        delta = self._ghost_sweep(sqlite, indexer, scope, delta)
+        if delta is not None:
+            context.code_search_delta = delta
         if delta is None or delta.is_empty():
             # READY + пустая delta: scoped работы в этом цикле нет. Но полный
             # BSL Phase B, недостроенный из-за прошлого embedding outage
@@ -3556,6 +3560,86 @@ class BslCodeSearchSync:
             len(delta.affected_rel_paths),
         )
         return result in _POST_MUTATION
+
+    # Порог, после которого призраков слишком много для точечного удаления.
+    _GHOST_MAX_RATIO = 0.05
+    _GHOST_MAX_ABS = 1000
+
+    @classmethod
+    def _ghost_sweep(cls, sqlite: Any, indexer: Any, scope: str, delta: Any) -> Any:
+        """Сверка индекса поиска по коду с графом.
+
+        Удаление объекта или формы вместе с модулем идёт через metadata-путь, который до
+        синхронизации поиска не доходит: строки удалённых процедур остаются в индексе
+        («призраки» в выдаче), а source_state_hash не пересчитывается — при следующем старте
+        контейнера metacode видит расхождение и перестраивает индекс целиком (часы на крупной
+        конфигурации; у нас — сотни призраков на проект после удаления форм).
+
+        Лишние routine_id ставятся в ledger как `deleted` с нулевым обратным вкладом: тела в
+        графе уже нет, вычесть его точно нельзя (тот же деградированный путь, что и для
+        deleted без записи); строки и фрагменты модулей удаляются, module FTS их rel_path
+        пересобирается, hash пересчитывается штатным apply. Если призраков больше порога —
+        полная перестройка запрашивается сразу, а не при случайном рестарте.
+        Любая ошибка здесь не должна ломать цикл: возвращаем delta как есть.
+        """
+        try:
+            epoch = sqlite.get_current_epoch(scope)
+            if not epoch:
+                return delta
+            in_index = sqlite.routine_rel_paths_in_epoch(scope, int(epoch))
+            if not in_index:
+                return delta
+            db = getattr(__import__("config").settings, "neo4j_database", "neo4j")
+            with indexer.driver.session(database=db) as session:
+                in_graph = {
+                    rec["id"] for rec in session.run(
+                        "MATCH (r:Routine) WHERE r.project_name = $p RETURN r.id AS id", p=scope,
+                    )
+                }
+            if not in_graph:
+                return delta  # граф пуст или недоступен — не трогаем индекс
+            ghosts = {rid: rel for rid, rel in in_index.items() if rid not in in_graph}
+            if not ghosts:
+                return delta
+            limit = max(cls._GHOST_MAX_ABS, int(len(in_index) * cls._GHOST_MAX_RATIO))
+            if len(ghosts) > limit:
+                logger.warning(
+                    "BslCodeSearchSync: %d routines in the search index are missing from the graph "
+                    "(limit %d) — requesting full rebuild", len(ghosts), limit,
+                )
+                sqlite.request_reindex(scope)
+                return delta
+            try:
+                vector_state = sqlite.vector_state(scope)
+                vector_epoch_target = int(getattr(vector_state, "vector_epoch", None) or epoch)
+            except Exception:
+                vector_epoch_target = int(epoch)
+            sqlite.write_pending_snapshot_and_ledger(
+                scope=scope,
+                snapshot_entries=[
+                    {"routine_id": rid, "idf_json": "{}", "stats_json": "{}"} for rid in ghosts
+                ],
+                ledger_rows=[
+                    {"routine_id": rid, "change_kind": "deleted", "old_rel_path": rel,
+                     "new_rel_path": "", "vector_epoch_target": vector_epoch_target,
+                     "stage": "snapshot_written"}
+                    for rid, rel in ghosts.items()
+                ],
+            )
+            if delta is None:
+                from .bsl_routine_delta import CodeSearchDelta as _LocalDelta
+                delta = _LocalDelta()
+            delta.deleted_routine_ids |= set(ghosts)
+            delta.affected_rel_paths |= {rel for rel in ghosts.values() if rel}
+            logger.info(
+                "BslCodeSearchSync: %d routines in the search index are missing from the graph "
+                "— scheduled for deletion (%d module files)", len(ghosts),
+                len({rel for rel in ghosts.values() if rel}),
+            )
+            return delta
+        except Exception:
+            logger.exception("BslCodeSearchSync: ghost sweep failed; continuing without it")
+            return delta
 
     def _maybe_recover_vector_phase_b(
         self, indexer: Any, sqlite: Any, scope: str, lease: Optional[LockLease],
