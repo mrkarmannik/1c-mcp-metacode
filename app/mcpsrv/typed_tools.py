@@ -9153,6 +9153,7 @@ Default limit is 5.
             return _fmt_dict({"items": [], "count": 0})
 
         from graphdb.bsl_code_search_service import (
+            BslCodeSearchGraphUnavailable,
             BslCodeSearchIndexNotReady,
             BslCodeSearchService,
         )
@@ -9186,6 +9187,14 @@ Default limit is 5.
                     "BSL code search index is not ready yet. "
                     "Indexing is in progress."
                 ),
+            })
+        except BslCodeSearchGraphUnavailable as e:
+            logging.warning("search_bsl_code: %s", e)
+            return _fmt_dict({
+                "items": [],
+                "count": 0,
+                "status": "graph_unavailable",
+                "message": str(e),
             })
         except Exception as e:
             logging.exception("search_bsl_code failed: %s", e)

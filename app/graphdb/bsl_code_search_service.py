@@ -104,6 +104,16 @@ _METADATA_WEIGHT = 6
 _METADATA_SYMBOL_WEIGHT = 1.0
 
 
+class BslCodeSearchGraphUnavailable(RuntimeError):
+    """Neo4j не ответил на чтение тел процедур (обрыв соединения, рестарт).
+
+    Это не расхождение индекса с графом: переиндексация не запрашивается, клиенту возвращается
+    просьба повторить запрос. В 2.0.1 такой сбой выглядел как «все процедуры пропали» и ставил
+    reindex_requested — один поиск в первые секунды после рестарта Neo4j давал полную перестройку
+    индекса (час и больше на крупной конфигурации).
+    """
+
+
 class BslCodeSearchIndexNotReady(RuntimeError):
     """Raised when search is requested before the first Phase A commit."""
 
@@ -1162,7 +1172,7 @@ class BslCodeSearchService:
             cache = self._request_body_cache
         missing = [rid for rid in unique_routine_ids if rid not in cache]
         if missing:
-            fetched = self._fetch_bodies(missing)
+            fetched = self._fetch_bodies(missing) or {}
             cache.update(fetched)
         bodies = {rid: cache[rid] for rid in unique_routine_ids if rid in cache}
         # Slice each unit's body by exact char range (Drift 2 fix):
@@ -1276,6 +1286,11 @@ class BslCodeSearchService:
         # Batch fetch routine bodies/signatures.
         routine_ids = list(groups.keys())
         body_map = self._fetch_bodies(routine_ids)
+        if body_map is None:
+            # Сбой чтения из Neo4j — не повод для переиндексации (BslCodeSearchGraphUnavailable).
+            raise BslCodeSearchGraphUnavailable(
+                "Neo4j не ответил при чтении тел процедур; повторите запрос через несколько секунд"
+            )
 
         # Order routines by best unit score; within a routine, order fragments
         # by line_start.
@@ -1289,6 +1304,9 @@ class BslCodeSearchService:
         for rid in ordered_ids:
             row = body_map.get(rid)
             if row is None:
+                logger.warning(
+                    "BSL search: routine_id=%s is in the index but absent in Neo4j; requesting reindex", rid,
+                )
                 self.sqlite.request_reindex(scope)
                 continue
             body = row.get("body") or ""
@@ -1339,7 +1357,9 @@ class BslCodeSearchService:
             results.append(result)
         return results
 
-    def _fetch_bodies(self, routine_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    def _fetch_bodies(self, routine_ids: List[str]) -> "Dict[str, Dict[str, Any]] | None":
+        """Тела и сигнатуры процедур из Neo4j. None — чтение не удалось (сбой Neo4j); пустой
+        словарь — таких процедур в графе нет. В 2.0.1 оба случая были пустым словарём."""
         if not routine_ids:
             return {}
         rows: Dict[str, Dict[str, Any]] = {}
@@ -1370,6 +1390,7 @@ class BslCodeSearchService:
                         rows[rid]["line"] = int(record["line"] or 0)
         except Exception as e:
             logger.warning("BSL search: failed to fetch routine bodies: %s", e)
+            return None
         return rows
 
     def _get_embedding_service_or_none(self):
