@@ -1450,16 +1450,20 @@ def _metadata_reference_values(node: ET.Element | None) -> List[str]:
 
 
 def _subsystem_chain(rel_parts: Tuple[str, ...], object_name: str) -> List[str]:
+    """Путь подсистемы по пути дескриптора: имя после каждого `Subsystems` плюс имя объекта.
+
+    `Subsystems/A.xml` → [A]; `Subsystems/A/Subsystems/B.xml` → [A, B];
+    `Subsystems/A/Subsystems/A.xml` → [A, A]. Раньше последний сегмент
+    отбрасывался, если совпадал с именем родителя, — вложенная подсистема получала путь
+    родителя, а в графе оба дескриптора склеивались в один узел. Так же путь строят
+    `incremental.xml_walker._resolve_owner_object_qn` и загрузчик расширений.
+    """
     chain = []
-    # Subsystems/<A>/Subsystems/<B>.xml -> [A, B]
     dirs = rel_parts[:-1]
-    for idx, part in enumerate(dirs[:-1]):
-        if part == "Subsystems" and idx + 1 < len(rel_parts):
-            next_part = dirs[idx + 1]
-            if next_part != "Subsystems":
-                chain.append(next_part)
-    if not chain or chain[-1] != object_name:
-        chain.append(object_name)
+    for idx in range(1, len(dirs)):
+        if dirs[idx - 1] == "Subsystems" and dirs[idx] != "Subsystems":
+            chain.append(dirs[idx])
+    chain.append(object_name)
     return chain
 
 

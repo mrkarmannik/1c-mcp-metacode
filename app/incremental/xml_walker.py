@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .extension_scope_cleanup import (
     ExtensionDiscoveryEvidence,
@@ -180,6 +180,57 @@ def _resolve_owner_object_qn(
     if object_name.endswith(".xml"):
         object_name = object_name[: -len(".xml")]
     return f"{project_name}/{config_name}/{category_ru}/{object_name}"
+
+
+def _same_name_subsystem_descriptors(rel_paths: Iterable[str]) -> List[Tuple[str, str, List[str]]]:
+    """Дескрипторы вложенных подсистем с именем родителя: `…/Subsystems/A/Subsystems/A.xml`.
+
+    Возвращает (rel_path, rel_path дескриптора родителя, путь подсистемы). Раньше парсер
+    (`xml_metadata.parser._subsystem_chain`) давал такой подсистеме путь родителя, и в графе
+    она склеивалась с ним в один узел.
+    """
+    out: List[Tuple[str, str, List[str]]] = []
+    for rel in rel_paths:
+        parts = rel.replace("\\", "/").strip("/").split("/")
+        if (
+            len(parts) >= 4
+            and parts[0] == "Subsystems"
+            and parts[-2] == "Subsystems"
+            and parts[-1].endswith(".xml")
+            and parts[-1][: -len(".xml")] == parts[-3]
+        ):
+            chain = [p for i, p in enumerate(parts[:-1]) if i > 0 and parts[i - 1] == "Subsystems"]
+            chain.append(parts[-1][: -len(".xml")])
+            out.append(("/".join(parts), "/".join(parts[:-2]) + ".xml", chain))
+    return out
+
+
+def _subsystem_merge_repair_paths(
+    xml_files: Iterable[Path], root: Path, state: Any, source_type: str
+) -> Set[str]:
+    """Какие дескрипторы перечитать, чтобы расклеить подсистемы в графе, загруженном старой версией парсера.
+
+    Для одноимённой вложенной подсистемы, у которой в состоянии объектов scope нет своего QN
+    (`…/Подсистемы/A/A`), возвращает её дескриптор и дескриптор родителя. Вызывающий убирает их
+    из manifest на этот цикл, и оба идут обычным путём как изменённые: вложенная подсистема
+    получает свой узел с рёбрами от родителя и категории, родитель — свои свойства (при склейке
+    победить могла вложенная). После успешного цикла QN есть в состоянии, и ремонт ничего не
+    делает. Хеши файлов при этом не меняются, поэтому без ремонта граф не починился бы никогда.
+    QN ищется по суффиксу: имя конфигурации расширения на этом шаге ещё не известно.
+    """
+    candidates = [p for p in xml_files if p.parent.name == "Subsystems" and p.parent.parent.name == p.stem]
+    if not candidates:
+        return set()
+    found = _same_name_subsystem_descriptors(str(p.relative_to(root)) for p in candidates)
+    if not found:
+        return set()
+    qns = state.get_all_object_qns(source_type)
+    out: Set[str] = set()
+    for rel, parent_rel, chain in found:
+        suffix = "/Подсистемы/" + "/".join(chain)
+        if not any(q.endswith(suffix) for q in qns):
+            out.update((rel, parent_rel))
+    return out
 
 
 def _is_configuration_xml(rel_path: str) -> bool:
@@ -637,6 +688,10 @@ def xml_incremental_run(
 
     # Batch-read всего manifest для XML scope: один SELECT вместо N per-file.
     manifest_by_rel = state.get_source_manifest_map("xml")
+    # Расклеить одноимённые вложенные подсистемы в графе, загруженном старой версией парсера.
+    for rel in _subsystem_merge_repair_paths(code_index.metadata_xml_files, code_directory, state, "xml"):
+        if manifest_by_rel.pop(rel, None) is not None:
+            logger.info("Subsystem merge repair: rereading %s", rel)
 
     candidate_files: List[Path] = []
     has_config_change = False
@@ -1170,6 +1225,10 @@ def _process_xml_extension_scope(
 
     # Batch-read всего manifest для scope: один SELECT вместо N per-file.
     manifest_by_rel = state.get_source_manifest_map(source_scope)
+    # Расклеить одноимённые вложенные подсистемы в графе, загруженном старой версией парсера.
+    for rel in _subsystem_merge_repair_paths(metadata_xml_files, ext_code_dir, state, source_scope):
+        if manifest_by_rel.pop(rel, None) is not None:
+            logger.info("Subsystem merge repair: rereading %s in %s", rel, source_scope)
 
     # 1. Discovery — реально изменённые XML.
     candidate_files: List[Path] = []
