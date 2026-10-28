@@ -333,6 +333,7 @@ class BslCodeSqlite:
 
         self._init_pragmas()
         self._init_schema()
+        self._ensure_planner_stats()
         self._ensure_additive_tables()
 
     # ------------------------------------------------------------------ init
@@ -373,6 +374,27 @@ class BslCodeSqlite:
             # счётчиков и ledger перед перезаписью тел, gate и scoped_retry_pending
             # перед сменой visibility. Потеря хвоста коммитов при отказе питания
             # оставила бы наполовину применённую операцию без возможности доиграть.
+
+    def _ensure_planner_stats(self, force: bool = False) -> None:
+        """Статистика для планировщика SQLite (`sqlite_stat1`).
+
+        Без неё планировщик для `WHERE project_name = ? AND index_epoch = ? AND routine_id = ?`
+        брал индекс (project_name, index_epoch, rel_path, …) и перебирал всю эпоху на каждую
+        процедуру (283 тыс. строк × 150 тыс. процедур на крупном обновлении — часы).
+        `analysis_limit` даёт приближённую статистику за секунды даже на БД в гигабайты.
+        Считается при первом открытии без статистики и после каждой смены эпохи.
+        """
+        try:
+            with self._lock:
+                cur = self._conn.cursor()
+                if not force and cur.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
+                ).fetchone():
+                    return
+                cur.execute("PRAGMA analysis_limit=1000")
+                cur.execute("ANALYZE")
+        except sqlite3.Error:
+            logger.warning("bsl_code_sqlite: ANALYZE failed; planner statistics may be stale", exc_info=True)
 
     def _user_version(self) -> int:
         with self._lock:
@@ -2678,8 +2700,11 @@ class BslCodeSqlite:
         rowids = [
             r["fts_rowid"]
             for r in cur.execute(
+                # `+project_name` выключает индексы, начинающиеся с project_name: без sqlite_stat1
+                # планировщик брал (project_name, index_epoch, rel_path, …) и на каждую процедуру
+                # перебирал все units эпохи (283 тыс. строк на УТ); так идёт seek по (routine_id, index_epoch).
                 "SELECT fts_rowid FROM bsl_code_units "
-                "WHERE project_name = ? AND index_epoch = ? AND routine_id = ?",
+                "WHERE +project_name = ? AND index_epoch = ? AND routine_id = ?",
                 (scope, int(epoch), routine_id),
             ).fetchall()
         ]
@@ -2701,7 +2726,7 @@ class BslCodeSqlite:
                 )
         cur.execute(
             "DELETE FROM bsl_code_units "
-            "WHERE project_name = ? AND index_epoch = ? AND routine_id = ?",
+            "WHERE +project_name = ? AND index_epoch = ? AND routine_id = ?",
             (scope, int(epoch), routine_id),
         )
         cur.execute(
@@ -3421,6 +3446,9 @@ class BslCodeSqlite:
                     (scope, new_current),
                 )
                 cur.execute("COMMIT")
+                # Новая эпоха — новое распределение данных; обновить статистику
+                # планировщика (ANALYZE вне транзакции, см. _ensure_planner_stats).
+                self._ensure_planner_stats(force=True)
                 return new_current
             except Exception:
                 cur.execute("ROLLBACK")
@@ -5372,7 +5400,7 @@ class BslCodeSqlite:
                         "    module_type = ?, "
                         "    routine_type = ?, "
                         "    export = ? "
-                        "WHERE project_name = ? AND index_epoch = ? "
+                        "WHERE +project_name = ? AND index_epoch = ? "
                         "AND routine_id = ?",
                         (
                             r.get("rel_path") or "",

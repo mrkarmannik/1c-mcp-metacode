@@ -298,6 +298,16 @@ class IncrementalLoadingState:
         conn.executescript(_SCHEMA_SQL)
         self._migrate_metadata_object_hashes(conn)
         self._migrate_extension_scope_cleanup(conn)
+        # Статистика планировщика (см. BslCodeSqlite._ensure_planner_stats) — одна
+        # и та же причина неудачных планов на составных индексах без sqlite_stat1.
+        try:
+            conn.execute("PRAGMA analysis_limit=1000")
+            if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
+            ).fetchone():
+                conn.execute("ANALYZE")
+        except sqlite3.Error:
+            logger.warning("incremental state: ANALYZE failed", exc_info=True)
         self._conn = conn
         return conn
 
