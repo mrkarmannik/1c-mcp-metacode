@@ -159,34 +159,37 @@ class IncrementalLoaderMixin:
         """
         if not object_qns:
             return []
-        cypher = """
-        UNWIND $qns AS qn
-        MATCH (role:MetadataObject)-[g:GRANTS_ACCESS_TO]->(child)
-        WHERE child.qualified_name IS NOT NULL
-          AND child.qualified_name STARTS WITH qn + '/'
-          AND any(l IN labels(child) WHERE l IN $whitelist)
-        RETURN
-            role.qualified_name AS role_qn,
-            child.qualified_name AS target_qn,
-            [l IN labels(child) WHERE l IN $whitelist][0] AS target_label,
-            properties(g) AS props
-        """
+        # Обход от children через индекс по qualified_name, по запросу на whitelist-метку.
+        # Исходный запрос начинал с NodeByLabelScan всех MetadataObject общего графа и разворачивал
+        # все GRANTS_ACCESS_TO (секунды на объект). Условие `[...][0] = $label` оставляет child
+        # только под его первой whitelist-меткой — ровно одна строка на ребро, как в исходнике.
         snapshot: List[Dict[str, Any]] = []
         with self.driver.session(database=settings.neo4j_database) as session:
-            result = session.run(
-                cypher,
-                qns=object_qns,
-                whitelist=INCREMENTAL_METADATA_CHILD_LABELS,
-            )
-            for record in result:
-                snapshot.append(
-                    {
-                        "role_qn": record["role_qn"],
-                        "target_qn": record["target_qn"],
-                        "target_label": record["target_label"],
-                        "props": dict(record["props"] or {}),
-                    }
+            for label in INCREMENTAL_METADATA_CHILD_LABELS:
+                result = session.run(
+                    "UNWIND $qns AS qn\n"
+                    f"MATCH (child:{_escape_label(label)})\n"
+                    "WHERE child.qualified_name STARTS WITH qn + '/'\n"
+                    "  AND [l IN labels(child) WHERE l IN $whitelist][0] = $label\n"
+                    "MATCH (role:MetadataObject)-[g:GRANTS_ACCESS_TO]->(child)\n"
+                    "RETURN\n"
+                    "    role.qualified_name AS role_qn,\n"
+                    "    child.qualified_name AS target_qn,\n"
+                    "    $label AS target_label,\n"
+                    "    properties(g) AS props",
+                    qns=object_qns,
+                    whitelist=INCREMENTAL_METADATA_CHILD_LABELS,
+                    label=label,
                 )
+                for record in result:
+                    snapshot.append(
+                        {
+                            "role_qn": record["role_qn"],
+                            "target_qn": record["target_qn"],
+                            "target_label": record["target_label"],
+                            "props": dict(record["props"] or {}),
+                        }
+                    )
         return snapshot
 
     def replay_grants_to_metadata_children(
@@ -239,38 +242,35 @@ class IncrementalLoaderMixin:
         if not exact_qns and not prefix_qns:
             return 0
         total = 0
+        # Отдельный запрос на каждую whitelist-метку вместо label-free `MATCH (n)`.
+        # Без метки Neo4j делает AllNodesScan всего общего графа на КАЖДЫЙ qn из списка
+        # (минуты на объект при ~17 млн узлов), а у всех whitelist-меток есть уникальный
+        # индекс по qualified_name. Узел с двумя whitelist-метками удалит первый же запрос,
+        # следующий его уже не найдёт — результат тот же, что у исходного запроса.
         with self.driver.session(database=settings.neo4j_database) as session:
-            if exact_qns:
-                rec = session.run(
-                    """
-                    UNWIND $exact_qns AS qn
-                    MATCH (n) WHERE n.qualified_name = qn
-                      AND any(l IN labels(n) WHERE l IN $whitelist)
-                    DETACH DELETE n
-                    RETURN count(*) AS deleted
-                    """,
-                    exact_qns=exact_qns,
-                    whitelist=INCREMENTAL_METADATA_CHILD_LABELS,
-                ).single()
-                total += rec["deleted"] if rec else 0
+            for label in INCREMENTAL_METADATA_CHILD_LABELS:
+                if exact_qns:
+                    rec = session.run(
+                        "UNWIND $exact_qns AS qn\n"
+                        f"MATCH (n:{_escape_label(label)} {{qualified_name: qn}})\n"
+                        "DETACH DELETE n\n"
+                        "RETURN count(*) AS deleted",
+                        exact_qns=exact_qns,
+                    ).single()
+                    total += rec["deleted"] if rec else 0
 
-            if prefix_qns:
-                # Двойное условие: parent (qn = p) + subtree (qn STARTS WITH p+'/').
-                # Без первой ветки сам TabularPart/UrlTemplate остался бы stale.
-                rec = session.run(
-                    """
-                    UNWIND $prefix_qns AS p
-                    MATCH (n)
-                    WHERE (n.qualified_name = p
-                           OR n.qualified_name STARTS WITH p + '/')
-                      AND any(l IN labels(n) WHERE l IN $whitelist)
-                    DETACH DELETE n
-                    RETURN count(*) AS deleted
-                    """,
-                    prefix_qns=prefix_qns,
-                    whitelist=INCREMENTAL_METADATA_CHILD_LABELS,
-                ).single()
-                total += rec["deleted"] if rec else 0
+                if prefix_qns:
+                    # Двойное условие: parent (qn = p) + subtree (qn STARTS WITH p+'/').
+                    # Без первой ветки сам TabularPart/UrlTemplate остался бы stale.
+                    rec = session.run(
+                        "UNWIND $prefix_qns AS p\n"
+                        f"MATCH (n:{_escape_label(label)})\n"
+                        "WHERE n.qualified_name = p OR n.qualified_name STARTS WITH p + '/'\n"
+                        "DETACH DELETE n\n"
+                        "RETURN count(*) AS deleted",
+                        prefix_qns=prefix_qns,
+                    ).single()
+                    total += rec["deleted"] if rec else 0
         return total
 
     def delete_metadata_owned_children(
@@ -284,28 +284,23 @@ class IncrementalLoaderMixin:
             return 0
         bs = batch_size or settings.neo4j_batch_size
         total = 0
-        cypher = """
-        UNWIND $qns AS qn
-        MATCH (n)
-        WHERE n.qualified_name IS NOT NULL
-          AND n.qualified_name STARTS WITH qn + '/'
-          AND any(l IN labels(n) WHERE l IN $whitelist)
-        WITH n LIMIT $batch_size
-        DETACH DELETE n
-        RETURN count(n) AS deleted
-        """
+        # По каждой метке через индекс по qualified_name (см. delete_child_nodes_by_qn).
         with self.driver.session(database=settings.neo4j_database) as session:
-            while True:
-                rec = session.run(
-                    cypher,
-                    qns=object_qns,
-                    whitelist=INCREMENTAL_METADATA_CHILD_LABELS,
-                    batch_size=bs,
-                ).single()
-                deleted = rec["deleted"] if rec else 0
-                total += deleted
-                if deleted < bs:
-                    break
+            for label in INCREMENTAL_METADATA_CHILD_LABELS:
+                cypher = (
+                    "UNWIND $qns AS qn\n"
+                    f"MATCH (n:{_escape_label(label)})\n"
+                    "WHERE n.qualified_name STARTS WITH qn + '/'\n"
+                    "WITH n LIMIT $batch_size\n"
+                    "DETACH DELETE n\n"
+                    "RETURN count(n) AS deleted"
+                )
+                while True:
+                    rec = session.run(cypher, qns=object_qns, batch_size=bs).single()
+                    deleted = rec["deleted"] if rec else 0
+                    total += deleted
+                    if deleted < bs:
+                        break
         return total
 
     # ------------------------------------------------------------------
@@ -342,24 +337,10 @@ class IncrementalLoaderMixin:
             if not command_qns:
                 return []
 
-            # Pass 2 — subtree wipe.
-            wipe_cypher = """
-            UNWIND $command_qns AS cmd_qn
-            MATCH (n)
-            WHERE n.qualified_name = cmd_qn
-               OR n.owner_qn = cmd_qn
-               OR (n.owner_qn IS NOT NULL AND n.owner_qn STARTS WITH cmd_qn + '/')
-            WITH n LIMIT $batch_size
-            DETACH DELETE n
-            RETURN count(n) AS deleted
-            """
-            while True:
-                rec = session.run(
-                    wipe_cypher, command_qns=command_qns, batch_size=bs
-                ).single()
-                deleted = rec["deleted"] if rec else 0
-                if deleted < bs:
-                    break
+            # Pass 2 — subtree wipe: qualified_name = cmd_qn или owner_qn в поддереве cmd_qn.
+            self._wipe_subtree_by_labels(
+                session, command_qns, qn_equal=True, qn_prefix=False, batch_size=bs
+            )
         return command_qns
 
     # ------------------------------------------------------------------
@@ -393,25 +374,79 @@ class IncrementalLoaderMixin:
                 return []
 
             # Pass 2 — 4-filter subtree wipe (qualified_name + owner_qn).
-            wipe_cypher = """
-            UNWIND $form_qns AS form_qn
-            MATCH (n)
-            WHERE n.qualified_name = form_qn
-               OR (n.qualified_name IS NOT NULL AND n.qualified_name STARTS WITH form_qn + '/')
-               OR n.owner_qn = form_qn
-               OR (n.owner_qn IS NOT NULL AND n.owner_qn STARTS WITH form_qn + '/')
-            WITH n LIMIT $batch_size
-            DETACH DELETE n
-            RETURN count(n) AS deleted
-            """
-            while True:
-                rec = session.run(
-                    wipe_cypher, form_qns=form_qns, batch_size=bs
-                ).single()
-                deleted = rec["deleted"] if rec else 0
-                if deleted < bs:
-                    break
+            self._wipe_subtree_by_labels(
+                session, form_qns, qn_equal=True, qn_prefix=True, batch_size=bs
+            )
         return form_qns
+
+    def _wipe_subtree_by_labels(
+        self,
+        session: Any,
+        roots: List[str],
+        *,
+        qn_equal: bool,
+        qn_prefix: bool,
+        batch_size: int,
+    ) -> int:
+        """DETACH DELETE узлов с qualified_name = root / STARTS WITH root + '/' (по флагам)
+        или owner_qn = root / STARTS WITH root + '/' — без label-free `MATCH (n)`.
+
+        Исходные запросы делали AllNodesScan всего общего графа на каждый root. Здесь запрос
+        идёт по каждой метке графа: по qualified_name — через индекс у меток, где он есть
+        (uq_*_qn), по owner_qn — у меток с индексом по owner_qn (Module, Routine). owner_qn
+        пишут только Module/Routine/RoutineCodeUnit, qualified_name у Module/Routine нет, так
+        что узлы не теряются. Метки без нужных индексов (RoutineCodeUnit, Project,
+        GraphSchemaState, будущие) сканируются по метке с исходным предикатом целиком.
+        ConsoleSearchable пропускается: её ставят `SET x:ConsoleSearchable` уже созданному узлу,
+        такой узел найдётся по основной метке. Так же BslCodeSearchUnit (есть только при включённых
+        векторах): это вторая метка Routine или RoutineCodeUnit, без индексов qualified_name /
+        owner_qn — иначе скан всех единиц векторного поиска (сотни тысяч узлов) на каждый root.
+        """
+        index_rows = session.run(
+            "SHOW INDEXES YIELD entityType, labelsOrTypes, properties, type\n"
+            "WHERE entityType = 'NODE' AND type = 'RANGE'\n"
+            "  AND size(labelsOrTypes) = 1 AND size(properties) = 1\n"
+            "RETURN labelsOrTypes[0] AS label, properties[0] AS prop"
+        ).values()
+        qn_labels = {row[0] for row in index_rows if row[1] == "qualified_name"}
+        owner_labels = {row[0] for row in index_rows if row[1] == "owner_qn"}
+        graph_labels = [row[0] for row in session.run("CALL db.labels() YIELD label RETURN label").values()]
+
+        qn_terms: List[str] = []
+        if qn_equal:
+            qn_terms.append("n.qualified_name = r")
+        if qn_prefix:
+            qn_terms.append("n.qualified_name STARTS WITH r + '/'")
+        owner_terms = ["n.owner_qn = r", "n.owner_qn STARTS WITH r + '/'"]
+
+        queries: List[Tuple[str, str]] = []
+        for label in graph_labels:
+            if label in ("ConsoleSearchable", "BslCodeSearchUnit"):
+                continue
+            if label in qn_labels:
+                queries.append((label, " OR ".join(qn_terms)))
+            if label in owner_labels:
+                queries.append((label, " OR ".join(owner_terms)))
+            if label not in qn_labels and label not in owner_labels:
+                queries.append((label, " OR ".join(qn_terms + owner_terms)))
+
+        total = 0
+        for label, where in queries:
+            cypher = (
+                "UNWIND $roots AS r\n"
+                f"MATCH (n:{_escape_label(label)})\n"
+                f"WHERE {where}\n"
+                "WITH n LIMIT $batch_size\n"
+                "DETACH DELETE n\n"
+                "RETURN count(n) AS deleted"
+            )
+            while True:
+                rec = session.run(cypher, roots=roots, batch_size=batch_size).single()
+                deleted = rec["deleted"] if rec else 0
+                total += deleted
+                if deleted < batch_size:
+                    break
+        return total
 
     # ------------------------------------------------------------------
     # cleanup_metadata_object_node
@@ -561,25 +596,10 @@ class IncrementalLoaderMixin:
         if not object_qns:
             return 0
         bs = batch_size or settings.neo4j_batch_size
-        total = 0
-        cypher = """
-        UNWIND $qns AS qn
-        MATCH (n)
-        WHERE (n.qualified_name IS NOT NULL AND n.qualified_name STARTS WITH qn + '/')
-           OR n.owner_qn = qn
-           OR (n.owner_qn IS NOT NULL AND n.owner_qn STARTS WITH qn + '/')
-        WITH n LIMIT $batch_size
-        DETACH DELETE n
-        RETURN count(n) AS deleted
-        """
         with self.driver.session(database=settings.neo4j_database) as session:
-            while True:
-                rec = session.run(cypher, qns=object_qns, batch_size=bs).single()
-                deleted = rec["deleted"] if rec else 0
-                total += deleted
-                if deleted < bs:
-                    break
-        return total
+            return self._wipe_subtree_by_labels(
+                session, object_qns, qn_equal=False, qn_prefix=True, batch_size=bs
+            )
 
     # ------------------------------------------------------------------
     # delete_configuration_scope — config-level аналог delete_object_subtree
