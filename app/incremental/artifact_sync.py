@@ -392,9 +392,25 @@ def _diff_scope(
     return diff
 
 
+def _index_targets_by_name(
+    targets: Set[Tuple[str, str, str, str, int, int]],
+) -> Dict[str, List[Tuple[str, str, str, str, int, int]]]:
+    """Routine targets, сгруппированные по name_lower (третий элемент кортежа).
+
+    `_callsite_matches_any` отбрасывает все цели с другим именем, поэтому перебор
+    всего набора на каждый callsite — лишняя работа: при 30 тыс. новых процедур и
+    2 млн callsites крупной конфигурации это 60 млрд сравнений (часы). С индексом
+    на callsite приходятся только одноимённые цели; результат тот же.
+    """
+    index: Dict[str, List[Tuple[str, str, str, str, int, int]]] = {}
+    for target in targets:
+        index.setdefault(target[2], []).append(target)
+    return index
+
+
 def _callsite_matches_any(
     callsite: Dict[str, Any],
-    targets: Set[Tuple[str, str, str, str, int, int]],
+    targets: Any,
 ) -> bool:
     """Best-effort prefilter match callsite-а к набору routine targets.
 
@@ -422,6 +438,9 @@ def _callsite_matches_any(
     ).lower()
     if not name:
         return False
+    if isinstance(targets, dict):
+        # Индекс из `_index_targets_by_name`: только цели с таким же именем.
+        targets = targets.get(name, ())
     cs_qualifier_raw = (callsite.get("qualifier") or callsite.get("callee_qualifier") or "").strip()
     # Normalize: short qualifier — первый сегмент chain (для CommonModule callsite).
     parts = cs_qualifier_raw.replace("/", ".").split(".") if cs_qualifier_raw else []
@@ -3157,10 +3176,11 @@ class PostLinkingSync:
             # у которых ext_code_dir временно отсутствует.
             for ext_dir_name in context.known_extension_configs.keys():
                 scan_scopes.append(ext_artifact_scope(source_mode_local, ext_dir_name, "bsl"))
+            targets_by_name = _index_targets_by_name(context.new_routine_targets)
             for scope in scan_scopes:
                 for art in self.state.all_bsl_file_artifacts(scope):
                     for cs in art["callsites"]:
-                        if _callsite_matches_any(cs, context.new_routine_targets):
+                        if _callsite_matches_any(cs, targets_by_name):
                             caller_id = cs.get("caller_id")
                             if caller_id and caller_id not in b_callers:
                                 c_callers.add(caller_id)
