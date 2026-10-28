@@ -696,7 +696,27 @@ class BslCodeSearchDeltaApplier:
                 return ApplyResult.SKIPPED_PENDING_RACE
             return ApplyResult.APPLIED
 
-        except Exception:
+        except Exception as exc:
+            # Детерминированный отказ (например,
+            # `corpus_idf underflow`) повтор не лечит: часть пачек уже могла
+            # закоммититься, и replay даёт ту же ошибку каждый цикл. Передаём
+            # восстановление полной перестройке — `REINDEX_REQUIRED` в readiness
+            # приоритетнее `SCOPED_RETRY`, а `commit_pending` новой epoch
+            # удалит ledger, записанный до её старта.
+            reason = _classify_apply_exception(exc)
+            if reason is not None:
+                logger.error(
+                    "BslCodeSearchDeltaApplier.apply: deterministic failure (%s) — "
+                    "requesting full rebuild of code search instead of endless replay",
+                    reason, exc_info=True,
+                )
+                try:
+                    self.sqlite.request_reindex(scope)
+                except Exception:
+                    logger.exception(
+                        "apply: failed to set reindex_requested after deterministic failure"
+                    )
+                return ApplyResult.FAILED_RETRY_QUEUED
             logger.exception(
                 "BslCodeSearchDeltaApplier.apply: unhandled error — "
                 "scoped_retry_pending stays set; ledger preserved for retry"

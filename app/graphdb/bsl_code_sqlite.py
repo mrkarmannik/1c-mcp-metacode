@@ -3396,7 +3396,7 @@ class BslCodeSqlite:
             cur.execute("BEGIN")
             try:
                 row = cur.execute(
-                    "SELECT current_epoch, pending_epoch, retired_epochs "
+                    "SELECT current_epoch, pending_epoch, retired_epochs, pending_started_at "
                     "FROM bsl_code_search_fingerprints WHERE project_name = ?",
                     (scope,),
                 ).fetchone()
@@ -3404,6 +3404,7 @@ class BslCodeSqlite:
                     raise BslCodeSqliteError(
                         f"commit_pending: no pending_epoch for scope={scope!r}"
                     )
+                pending_started_at = row["pending_started_at"]
                 old_current = int(row["current_epoch"]) if row["current_epoch"] is not None else 0
                 new_current = int(row["pending_epoch"])
                 retired = json.loads(row["retired_epochs"] or "[]")
@@ -3445,14 +3446,86 @@ class BslCodeSqlite:
                     "WHERE project_name = ? AND index_epoch = ?",
                     (scope, new_current),
                 )
+                dropped = self._drop_ledger_superseded_by_rebuild_in_tx(
+                    cur, scope, pending_started_at,
+                )
                 cur.execute("COMMIT")
                 # Новая эпоха — новое распределение данных; обновить статистику
                 # планировщика (ANALYZE вне транзакции, см. _ensure_planner_stats).
                 self._ensure_planner_stats(force=True)
+                if dropped:
+                    logger.warning(
+                        "commit_pending: dropped %d scoped-delta ledger rows written "
+                        "before the rebuild started (%s); epoch %d already contains them",
+                        dropped, pending_started_at, new_current,
+                    )
                 return new_current
             except Exception:
                 cur.execute("ROLLBACK")
                 raise
+
+    def _drop_ledger_superseded_by_rebuild_in_tx(
+        self, cur: Any, scope: str, pending_started_at: Any,
+    ) -> int:
+        """Ledger, записанный ДО старта полной перестройки,
+        после публикации новой epoch устарел: перестройка читала уже обновлённый
+        граф, и эти изменения в новой epoch есть. Без очистки следующий цикл
+        реплеит ledger поверх новой epoch и вычитает counters старых версий
+        процедур, которых в ней нет → `corpus_idf underflow` навсегда.
+
+        Строки новее старта перестройки не трогаем: их она могла не увидеть.
+        Если ledger опустел — снимаем scoped-флаги и reader gate так же, как
+        `commit_scoped_delta`. Вызывается внутри транзакции `commit_pending`.
+        Возвращает число удалённых строк ledger.
+        """
+        import calendar
+
+        if not pending_started_at:
+            return 0
+        try:
+            started = calendar.timegm(
+                time.strptime(str(pending_started_at), "%Y-%m-%dT%H:%M:%SZ")
+            )
+        except (ValueError, OverflowError):
+            return 0
+        stale_ids = [
+            r[0] for r in cur.execute(
+                "SELECT routine_id FROM bsl_code_pending_scoped_delta "
+                "WHERE project_name = ? AND updated_at < ?",
+                (scope, started),
+            ).fetchall()
+        ]
+        if not stale_ids:
+            return 0
+        cur.execute(
+            "DELETE FROM bsl_code_pending_scoped_delta "
+            "WHERE project_name = ? AND updated_at < ?",
+            (scope, started),
+        )
+        for start in range(0, len(stale_ids), 500):
+            chunk = stale_ids[start: start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            cur.execute(
+                f"DELETE FROM bsl_code_pending_reverse_snapshot "
+                f"WHERE project_name = ? AND routine_id IN ({placeholders})",
+                (scope, *chunk),
+            )
+        remaining = cur.execute(
+            "SELECT 1 FROM bsl_code_pending_scoped_delta WHERE project_name = ? LIMIT 1",
+            (scope,),
+        ).fetchone()
+        if remaining is None:
+            cur.execute(
+                "UPDATE bsl_code_search_fingerprints "
+                "SET scoped_apply_in_progress = 0, "
+                "    scoped_retry_pending = 0, "
+                "    visibility_flip_done = 0, "
+                "    pending_routine_ids_json = '[]', "
+                "    pending_rel_paths_json = '[]' "
+                "WHERE project_name = ?",
+                (scope,),
+            )
+        return len(stale_ids)
 
     def read_phase_b_transfer_snapshot(self, scope: str) -> Dict[str, Any]:
         """Read the durable Phase B transfer snapshot captured by
