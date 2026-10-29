@@ -1302,6 +1302,22 @@ def _substring_sources(target, text: str, param_name: str):
     return src, scan_src
 
 
+def _substring_source_for_owner(src, scan_src, owner_qn):
+    """Источник подстрочного поиска с учётом владельца.
+
+    Fulltext-ускоритель один на весь граф: `*загруз*` даёт сотни тысяч кандидатов по всем
+    проектам (у нас 203 тыс. на 35 конфигураций), и только потом они фильтруются до десятков процедур
+    владельца; под нагрузкой Neo4j (стартовая загрузка соседнего проекта) такой запрос упирался
+    в таймаут read-запросов. При заданном `owner_ref` фильтр `r.owner_qn = $owner_qn OR
+    STARTS WITH` идёт по idx_routine_owner_qn и даёт те же строки за миллисекунды — берём
+    scan-источник, и запасным тоже он (откатываться с него некуда). Верификатор CONTAINS
+    в обоих источниках один и тот же, результат не меняется.
+    """
+    if owner_qn:
+        return scan_src, scan_src
+    return src, scan_src
+
+
 def _module_type_block(has_interception: bool) -> str:
     if has_interception:
         return (
@@ -6030,6 +6046,10 @@ RETURN rid AS id,
                     # returned section is what decides, so the result is unchanged.
                     substring_src, substring_scan_src = _substring_sources(
                         target, params["text"], "text",
+                    )
+                    # С владельцем — по индексу owner_qn, не через глобальный fulltext.
+                    substring_src, substring_scan_src = _substring_source_for_owner(
+                        substring_src, substring_scan_src, owner_qn,
                     )
                     source_cypher = substring_src.cypher
                 else:
